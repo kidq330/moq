@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/moq-dev/moq/compare/moq-video-v0.0.9...moq-video-v0.0.10) - 2026-07-25
+
+### Added
+
+- *(moq-video)* resize pixel buffers on hardware ([#2512](https://github.com/moq-dev/moq/pull/2512))
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 2 updates ([#2455](https://github.com/moq-dev/moq/pull/2455))
+- *(moq-video)* [**breaking**] one raw Frame type, and carry timestamps through encode ([#2503](https://github.com/moq-dev/moq/pull/2503))
+
+## [0.0.9](https://github.com/moq-dev/moq/compare/moq-video-v0.0.8...moq-video-v0.0.9) - 2026-07-24
+
+### Added
+
+- *(capture)* enumerate Linux and Windows sources ([#2486](https://github.com/moq-dev/moq/pull/2486))
+- *(moq-mux,moq-boy)* mark discontinuities, and never time a sample across one ([#2475](https://github.com/moq-dev/moq/pull/2475))
+
+### Other
+
+- *(moq-video)* bump moq-vaapi to 0.0.3 (dlopen libva) ([#2465](https://github.com/moq-dev/moq/pull/2465))
+
+### Added
+
+- List V4L2 and Media Foundation cameras on Linux and Windows, and list DXGI
+  displays on Windows, using identifiers accepted by `capture::Source`.
+
 ## [0.0.8](https://github.com/moq-dev/moq/compare/moq-video-v0.0.7...moq-video-v0.0.8) - 2026-07-23
 
 ### Other
