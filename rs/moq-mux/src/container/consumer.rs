@@ -1701,6 +1701,44 @@ mod tests {
 		finisher.await.unwrap();
 	}
 
+	/// Forces the arrival race that normally needs a relay and independently
+	/// scheduled QUIC streams: groups reach the consumer in arrival order, and
+	/// in-process arrival order is simply creation order, so creating group 1,
+	/// letting the consumer poll, then creating group 0 deterministically makes
+	/// the later group win. An explicit `group_start` subscription asks for
+	/// group 0, so the not-yet-arrived head is in flight, not evicted, and the
+	/// latency budget is exactly the tolerance meant to cover it.
+	#[tokio::test]
+	async fn startup_keeps_late_arriving_head_group_within_latency() {
+		tokio::time::pause();
+		let mut track = track_producer("test", hang::container::track_info());
+		let consumer_track = track.subscribe(moq_net::track::Subscription::default().with_group_start(0));
+		let mut consumer = Consumer::new(consumer_track, Container::Legacy).with_latency(Duration::from_millis(500));
+
+		// Group 1's stream wins the race...
+		write_group(&mut track, 1, &[ts(100_000)]);
+
+		// ...and the consumer polls before group 0 lands. The intended behavior
+		// waits for the requested head, so a timeout here is fine; the broken
+		// startup commits to group 1 instead and returns its frame.
+		let mut frames = Vec::new();
+		if let Ok(frame) = tokio::time::timeout(Duration::from_millis(50), consumer.read()).await {
+			frames.push(frame.unwrap().expect("track still live"));
+		}
+
+		// Group 0 arrives moments later, well within the 500ms latency budget.
+		write_group(&mut track, 0, &[ts(0)]);
+		track.finish().unwrap();
+
+		frames.extend(read_all(&mut consumer).await.unwrap());
+
+		let timestamps: Vec<_> = frames.iter().map(|f| f.timestamp).collect();
+		assert!(
+			timestamps.contains(&ts(0)),
+			"head group 0 arrived within the latency budget but was dropped: {timestamps:?}"
+		);
+	}
+
 	#[tokio::test]
 	async fn startup_skips_groups_without_data() {
 		tokio::time::pause();

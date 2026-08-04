@@ -81,3 +81,6 @@ sd-notify = "0.5"
 rcgen = "0.14"
 tempfile = "3"
 wiremock = "0.6"
+moq-mux = { workspace = true }
+hang = { workspace = true }
+bytes = "1"
