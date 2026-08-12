@@ -1906,6 +1906,96 @@ mod tests {
 		finisher.await.unwrap();
 	}
 
+	/// Forces the arrival race that normally needs a relay and independently
+	/// scheduled QUIC streams: groups reach the consumer in arrival order, and
+	/// in-process arrival order is simply creation order, so creating group 1,
+	/// letting the consumer poll, then creating group 0 deterministically makes
+	/// the later group win. An explicit start subscription asks for group 0, so
+	/// the not-yet-arrived head is in flight, not evicted, and the max age
+	/// budget is exactly the tolerance meant to cover it.
+	#[tokio::test]
+	async fn startup_keeps_late_arriving_head_group_within_max_age() {
+		tokio::time::pause();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let consumer_track = track.subscribe(
+			moq_net::track::Subscription::default()
+				.with_start(moq_net::track::Position::group(0))
+				.with_max_age(Duration::from_millis(500)),
+		);
+		let mut consumer = Consumer::new(consumer_track, Container::Legacy);
+
+		// Group 1's stream wins the race...
+		write_group(&mut track, 1, &[ts(100_000)]);
+
+		// ...and the consumer polls before group 0 lands. The intended behavior
+		// waits for the requested head, so a timeout here is fine; the broken
+		// startup commits to group 1 instead and returns its frame.
+		let mut frames = Vec::new();
+		if let Ok(frame) = tokio::time::timeout(Duration::from_millis(50), consumer.read()).await {
+			frames.push(frame.unwrap().expect("track still live"));
+		}
+
+		// Group 0 arrives moments later, well within the 500ms budget.
+		write_group(&mut track, 0, &[ts(0)]);
+		track.finish().unwrap();
+
+		frames.extend(read_all(&mut consumer).await.unwrap());
+
+		let timestamps: Vec<_> = frames.iter().map(|f| f.timestamp).collect();
+		assert!(
+			timestamps.contains(&ts(0)),
+			"head group 0 arrived within the max age budget but was dropped: {timestamps:?}"
+		);
+	}
+
+	/// The arrival race the poll_empty gate does NOT cover: group 1's *stream*
+	/// itself loses the race, so when group 0 finishes there is a sequence gap
+	/// in pending. The gap arm takes the buffered group 2 as proof group 1 was
+	/// evicted, though under the newest-first stream scheduler its stream is
+	/// merely late; in-process, arrival order is creation order, so creating
+	/// group 2 before group 1 forces it deterministically. This is the drop the
+	/// relay repro hits (`moq-relay/tests/moq_mux_group_loss.rs`, missing
+	/// indices [10..20)).
+	#[tokio::test]
+	async fn gap_keeps_late_arriving_group_within_max_age() {
+		tokio::time::pause();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let consumer_track = track.subscribe(
+			moq_net::track::Subscription::default()
+				.with_start(moq_net::track::Position::group(0))
+				.with_max_age(Duration::from_millis(500)),
+		);
+		let mut consumer = Consumer::new(consumer_track, Container::Legacy);
+
+		// Group 2's stream beats group 1's, which hasn't arrived at all yet.
+		write_group(&mut track, 0, &[ts(0)]);
+		write_group(&mut track, 2, &[ts(200_000)]);
+
+		let mut frames = Vec::new();
+		let first = consumer.read().await.unwrap().expect("group 0 frame");
+		assert_eq!(first.timestamp, ts(0));
+		frames.push(first);
+
+		// Group 0 is done; group 1's stream is still racing. The intended
+		// behavior waits within the budget, so a timeout here is fine; the
+		// broken gap arm skips to group 2 and returns its frame instead.
+		if let Ok(frame) = tokio::time::timeout(Duration::from_millis(50), consumer.read()).await {
+			frames.push(frame.unwrap().expect("track still live"));
+		}
+
+		// Group 1's stream opens moments later, well within the 500ms budget.
+		write_group(&mut track, 1, &[ts(100_000)]);
+		track.finish().unwrap();
+
+		frames.extend(read_all(&mut consumer).await.unwrap());
+
+		let timestamps: Vec<_> = frames.iter().map(|f| f.timestamp).collect();
+		assert!(
+			timestamps.contains(&ts(100_000)),
+			"group 1 arrived within the max age budget but was dropped: {timestamps:?}"
+		);
+	}
+
 	#[tokio::test]
 	async fn startup_skips_groups_without_data() {
 		tokio::time::pause();
