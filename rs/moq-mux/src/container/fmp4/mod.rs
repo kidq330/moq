@@ -523,7 +523,7 @@ fn trun_duration(duration: Timestamp, timescale: moq_net::Timescale) -> Result<u
 /// Synthesize a CMAF `Trak` for a video rendition that has no init segment.
 ///
 /// Used by the fMP4 exporter when its source is a `Container::Legacy` track
-/// (Avc3/Hev1/etc. importers that publish raw codec bitstreams). H.264/H.265
+/// (Annex-B and similar importers that publish raw codec bitstreams). H.264/H.265
 /// need their out-of-band configuration record (`description`), e.g. because the
 /// Avc1 / Hvc1 transform has finished building it from inline parameter sets.
 /// VP8 carries no out-of-band config, so `description` is `None` for it.

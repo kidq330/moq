@@ -202,7 +202,7 @@ impl ExportSource {
 
 	/// Pull the next normalized frame.
 	///
-	/// Parameter-only frames (SPS/PPS-only inputs to the Avc3 transform) are
+	/// Parameter-only frames (SPS/PPS-only inputs to the Annex-B transform) are
 	/// absorbed and the next frame is polled. Returns `Ready(None)` at
 	/// end-of-track.
 	pub fn poll_read(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Frame>>> {

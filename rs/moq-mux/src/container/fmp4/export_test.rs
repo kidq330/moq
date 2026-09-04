@@ -7,7 +7,7 @@ use mp4_atom::{DecodeMaybe, Encode};
 
 use crate::container::test_util::{Live, PPS, SPS, raw_frame, video_frame};
 
-/// Avc3-shape source (catalog `Container::Legacy`, `H264 { inline: true }`,
+/// Annex-B source (catalog `Container::Legacy`, `H264 { inline: true }`,
 /// `description: None`) → fMP4 / CMAF export must synthesize a valid init
 /// segment from the codec config the Avc1 transform builds on the wire.
 ///
@@ -374,7 +374,7 @@ async fn av1_source_to_cmaf_export_synthesizes_av01() {
 /// CMAF source (catalog `Container::Cmaf`) → fMP4 export should keep using
 /// the passthrough init path: existing init bytes are merged into the moov.
 ///
-/// Regression check that adding the Avc3 path didn't break the existing one.
+/// Regression check that adding the Annex-B path didn't break the existing one.
 #[tokio::test(start_paused = true)]
 async fn cmaf_source_to_cmaf_export_passthrough() {
 	let data = include_bytes!("test_data/bbb.mp4");

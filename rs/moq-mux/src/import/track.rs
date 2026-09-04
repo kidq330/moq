@@ -24,12 +24,12 @@ fn video_hint(init: &Init, default_codec: Option<hang::catalog::VideoCodec>) -> 
 	hint
 }
 
-/// Build an H.264 avc3 split + import pair.
+/// Build an H.264 Annex-B split + import pair.
 ///
 /// The import reads `init` for the codec config (or publishes from `hint` up front); the split then
 /// reads it as the leading bytes of the stream (caching any inline SPS/PPS). Any frames in the init
 /// buffer are published.
-fn build_h264_avc3<E: CatalogExt>(
+fn build_h264_annexb<E: CatalogExt>(
 	track: moq_net::track::Producer,
 	reserved: crate::catalog::Reserved<E>,
 	init: &[u8],
@@ -58,8 +58,8 @@ fn build_h264_avc1<E: CatalogExt>(
 	Ok((length_size, import))
 }
 
-/// Build an H.265 split + import pair.
-fn build_h265<E: CatalogExt>(
+/// Build an H.265 Annex-B split + import pair.
+fn build_h265_annexb<E: CatalogExt>(
 	track: moq_net::track::Producer,
 	reserved: crate::catalog::Reserved<E>,
 	init: &[u8],
@@ -111,9 +111,9 @@ fn build_av1<E: CatalogExt>(
 }
 
 enum TrackKind<E: CatalogExt = ()> {
-	/// H.264 avc3 (Annex-B, inline SPS/PPS). The split owns byte parsing; the
+	/// H.264 Annex-B (inline SPS/PPS). The split owns byte parsing; the
 	/// import publishes.
-	Avc3 {
+	H264AnnexB {
 		split: crate::codec::h264::Split,
 		import: crate::codec::h264::Import<E>,
 	},
@@ -124,7 +124,8 @@ enum TrackKind<E: CatalogExt = ()> {
 		length_size: usize,
 		import: crate::codec::h264::Import<E>,
 	},
-	Hev1 {
+	/// H.265 Annex-B (inline VPS/SPS/PPS).
+	H265AnnexB {
 		split: crate::codec::h265::Split,
 		import: crate::codec::h265::Import<E>,
 	},
@@ -183,17 +184,19 @@ impl<E: CatalogExt> Track<E> {
 				let (length_size, import) = build_h264_avc1(track, reserved, data, video_hint(&init, None))?;
 				TrackKind::Avc1 { length_size, import }
 			}
+			// The "avc3"/"hev1" tokens name the codec-string prefix the catalog
+			// advertises for in-band tracks; the input itself is an Annex-B stream.
 			"avc3" | "h264" => {
-				let (split, import) = build_h264_avc3(track, reserved, data, video_hint(&init, None))?;
-				TrackKind::Avc3 { split, import }
+				let (split, import) = build_h264_annexb(track, reserved, data, video_hint(&init, None))?;
+				TrackKind::H264AnnexB { split, import }
 			}
 			"hvc1" | "hvcc" => {
 				let (length_size, import) = build_h265_hvc1(track, reserved, data, video_hint(&init, None))?;
 				TrackKind::Hvc1 { length_size, import }
 			}
 			"hev1" => {
-				let (split, import) = build_h265(track, reserved, data, video_hint(&init, None))?;
-				TrackKind::Hev1 { split, import }
+				let (split, import) = build_h265_annexb(track, reserved, data, video_hint(&init, None))?;
+				TrackKind::H265AnnexB { split, import }
 			}
 			"av01" | "av1" | "av1c" | "av1C" => {
 				let (split, import) = build_av1(track, reserved, data, video_hint(&init, None))?;
@@ -242,7 +245,7 @@ impl<E: CatalogExt> Track<E> {
 	/// Decode one whole frame.
 	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<moq_net::Timestamp>) -> Result<()> {
 		match self.kind {
-			TrackKind::Avc3 {
+			TrackKind::H264AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -260,7 +263,7 @@ impl<E: CatalogExt> Track<E> {
 				let frame = crate::codec::h264::avc1_frame(frame, length_size, pts)?;
 				import.decode([frame])?;
 			}
-			TrackKind::Hev1 {
+			TrackKind::H265AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -312,9 +315,9 @@ impl<E: CatalogExt> Track<E> {
 	/// Finish the importer, flushing any buffered data.
 	pub fn finish(&mut self) -> Result<()> {
 		match self.kind {
-			TrackKind::Avc3 { ref mut import, .. } => import.finish(),
+			TrackKind::H264AnnexB { ref mut import, .. } => import.finish(),
 			TrackKind::Avc1 { ref mut import, .. } => import.finish(),
-			TrackKind::Hev1 { ref mut import, .. } => import.finish(),
+			TrackKind::H265AnnexB { ref mut import, .. } => import.finish(),
 			TrackKind::Hvc1 { ref mut import, .. } => import.finish(),
 			TrackKind::Av01 { ref mut import, .. } => import.finish(),
 			TrackKind::Vp8(ref mut import) => import.finish(),
@@ -330,9 +333,9 @@ impl<E: CatalogExt> Track<E> {
 	/// see the real cause rather than [`moq_net::Error::Dropped`]. Consumes the importer.
 	pub fn abort(self, err: moq_net::Error) {
 		match self.kind {
-			TrackKind::Avc3 { import, .. } => import.abort(err),
+			TrackKind::H264AnnexB { import, .. } => import.abort(err),
 			TrackKind::Avc1 { import, .. } => import.abort(err),
-			TrackKind::Hev1 { import, .. } => import.abort(err),
+			TrackKind::H265AnnexB { import, .. } => import.abort(err),
 			TrackKind::Hvc1 { import, .. } => import.abort(err),
 			TrackKind::Av01 { import, .. } => import.abort(err),
 			TrackKind::Vp8(import) => import.abort(err),
@@ -347,9 +350,9 @@ impl<E: CatalogExt> Track<E> {
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
 		match self.kind {
-			TrackKind::Avc3 { ref mut import, .. } => import.cut(end),
+			TrackKind::H264AnnexB { ref mut import, .. } => import.cut(end),
 			TrackKind::Avc1 { ref mut import, .. } => import.cut(end),
-			TrackKind::Hev1 { ref mut import, .. } => import.cut(end),
+			TrackKind::H265AnnexB { ref mut import, .. } => import.cut(end),
 			TrackKind::Hvc1 { ref mut import, .. } => import.cut(end),
 			TrackKind::Av01 { ref mut import, .. } => import.cut(end),
 			TrackKind::Vp8(ref mut import) => import.cut(end),
@@ -364,7 +367,7 @@ impl<E: CatalogExt> Track<E> {
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		match self.kind {
-			TrackKind::Avc3 {
+			TrackKind::H264AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -372,7 +375,7 @@ impl<E: CatalogExt> Track<E> {
 				import.seek(sequence)
 			}
 			TrackKind::Avc1 { ref mut import, .. } => import.seek(sequence),
-			TrackKind::Hev1 {
+			TrackKind::H265AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -399,9 +402,9 @@ impl<E: CatalogExt> Track<E> {
 	/// A watch-only handle to the track's subscriber demand.
 	pub fn demand(&self) -> moq_net::track::Demand {
 		match self.kind {
-			TrackKind::Avc3 { ref import, .. } => import.demand(),
+			TrackKind::H264AnnexB { ref import, .. } => import.demand(),
 			TrackKind::Avc1 { ref import, .. } => import.demand(),
-			TrackKind::Hev1 { ref import, .. } => import.demand(),
+			TrackKind::H265AnnexB { ref import, .. } => import.demand(),
 			TrackKind::Hvc1 { ref import, .. } => import.demand(),
 			TrackKind::Av01 { ref import, .. } => import.demand(),
 			TrackKind::Vp8(ref import) => import.demand(),
@@ -450,13 +453,14 @@ impl<E: CatalogExt> From<crate::codec::mp3::Import<E>> for Track<E> {
 }
 
 enum TrackStreamKind<E: CatalogExt = ()> {
-	/// H.264 in avc3 wire shape (Annex-B with inline SPS/PPS). The split owns
-	/// byte parsing; the import publishes.
-	Avc3 {
+	/// H.264 Annex-B (inline SPS/PPS). The split owns byte parsing; the
+	/// import publishes.
+	H264AnnexB {
 		split: crate::codec::h264::Split,
 		import: crate::codec::h264::Import<E>,
 	},
-	Hev1 {
+	/// H.265 Annex-B (inline VPS/SPS/PPS).
+	H265AnnexB {
 		split: crate::codec::h265::Split,
 		import: crate::codec::h265::Import<E>,
 	},
@@ -487,11 +491,11 @@ impl<E: CatalogExt> TrackStream<E> {
 		let hint = video_hint(&init, None);
 		// Only the self-delimiting codecs can be recovered from a raw byte stream.
 		let kind = match init.format.as_str() {
-			"avc3" | "h264" => TrackStreamKind::Avc3 {
+			"avc3" | "h264" => TrackStreamKind::H264AnnexB {
 				split: crate::codec::h264::Split::new(),
 				import: crate::codec::h264::Import::new(track, reserved, hint)?,
 			},
-			"hev1" => TrackStreamKind::Hev1 {
+			"hev1" => TrackStreamKind::H265AnnexB {
 				split: crate::codec::h265::Split::new(),
 				import: crate::codec::h265::Import::new(track, reserved, hint)?,
 			},
@@ -514,7 +518,7 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// This is not required for self-describing formats like AVC3.
 	pub fn initialize(&mut self, data: &[u8]) -> Result<()> {
 		match self.kind {
-			TrackStreamKind::Avc3 {
+			TrackStreamKind::H264AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -522,7 +526,7 @@ impl<E: CatalogExt> TrackStream<E> {
 				let frames = split.decode(data, None)?;
 				import.decode(frames)?;
 			}
-			TrackStreamKind::Hev1 {
+			TrackStreamKind::H265AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -552,14 +556,14 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// Decode a chunk of the byte stream.
 	pub fn decode(&mut self, data: &[u8]) -> Result<()> {
 		match self.kind {
-			TrackStreamKind::Avc3 {
+			TrackStreamKind::H264AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
 				let frames = split.decode(data, None)?;
 				import.decode(frames)
 			}
-			TrackStreamKind::Hev1 {
+			TrackStreamKind::H265AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -579,7 +583,7 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// Finish the importer, flushing any buffered data.
 	pub fn finish(&mut self) -> Result<()> {
 		match self.kind {
-			TrackStreamKind::Avc3 {
+			TrackStreamKind::H264AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -587,7 +591,7 @@ impl<E: CatalogExt> TrackStream<E> {
 				import.decode(tail)?;
 				import.finish()
 			}
-			TrackStreamKind::Hev1 {
+			TrackStreamKind::H265AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -610,8 +614,8 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// see the real cause rather than [`moq_net::Error::Dropped`]. Consumes the importer.
 	pub fn abort(self, err: moq_net::Error) {
 		match self.kind {
-			TrackStreamKind::Avc3 { import, .. } => import.abort(err),
-			TrackStreamKind::Hev1 { import, .. } => import.abort(err),
+			TrackStreamKind::H264AnnexB { import, .. } => import.abort(err),
+			TrackStreamKind::H265AnnexB { import, .. } => import.abort(err),
 			TrackStreamKind::Av01 { import, .. } => import.abort(err),
 		}
 	}
@@ -619,8 +623,8 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
 		match self.kind {
-			TrackStreamKind::Avc3 { ref mut import, .. } => import.cut(end),
-			TrackStreamKind::Hev1 { ref mut import, .. } => import.cut(end),
+			TrackStreamKind::H264AnnexB { ref mut import, .. } => import.cut(end),
+			TrackStreamKind::H265AnnexB { ref mut import, .. } => import.cut(end),
 			TrackStreamKind::Av01 { ref mut import, .. } => import.cut(end),
 		}
 	}
@@ -628,14 +632,14 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		match self.kind {
-			TrackStreamKind::Avc3 {
+			TrackStreamKind::H264AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
 				split.reset();
 				import.seek(sequence)
 			}
-			TrackStreamKind::Hev1 {
+			TrackStreamKind::H265AnnexB {
 				ref mut split,
 				ref mut import,
 			} => {
@@ -655,8 +659,8 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// A watch-only handle to the track's subscriber demand.
 	pub fn demand(&self) -> moq_net::track::Demand {
 		match self.kind {
-			TrackStreamKind::Avc3 { ref import, .. } => import.demand(),
-			TrackStreamKind::Hev1 { ref import, .. } => import.demand(),
+			TrackStreamKind::H264AnnexB { ref import, .. } => import.demand(),
+			TrackStreamKind::H265AnnexB { ref import, .. } => import.demand(),
 			TrackStreamKind::Av01 { ref import, .. } => import.demand(),
 		}
 	}

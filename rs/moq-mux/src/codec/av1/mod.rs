@@ -98,7 +98,7 @@ pub(crate) fn av1_from_av1c(av1c: &mp4_atom::Av1c) -> AV1 {
 ///
 /// `config_obus` is left empty: moq-video publishes AV1 with the sequence
 /// header inline in the bitstream (the `.av01` in-band case, analogous to
-/// `hev1`/`avc3`), so the decoder reads it from the keyframe rather than the
+/// in-band H.264/H.265), so the decoder reads it from the keyframe rather than the
 /// out-of-band config record. The catalog's color fields (color primaries,
 /// transfer characteristics, matrix coefficients, full range) have no slot in
 /// av1C; they live in the sequence header OBU instead.

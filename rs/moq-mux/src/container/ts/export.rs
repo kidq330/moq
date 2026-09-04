@@ -8,9 +8,9 @@
 //! Video is carried as Annex-B, audio as ADTS AAC.
 //!
 //! Video flows through [`ExportSource`], which normalizes every H.264/H.265
-//! source to length-prefixed NALU plus a resolved avcC/hvcC (parsing in-band
-//! avc3/hev1 parameter sets out of the bitstream, or taking the catalog
-//! `description` for out-of-band avc1/hvc1). The muxer then does one
+//! source to length-prefixed NALU plus a resolved avcC/hvcC (parsing the
+//! in-band parameter sets out of an Annex-B bitstream, or taking the catalog
+//! `description` of an out-of-band source). The muxer then does one
 //! length-prefixed -> Annex-B conversion, re-injecting the parameter sets as
 //! inline NALs on every keyframe. CMAF tracks are rejected with a clear error.
 
@@ -257,7 +257,7 @@ impl<E: catalog::Catalog> Export<E> {
 		}
 
 		// 2. Pull a frame into every idle track. ExportSource has already
-		// transformed Annex-B avc3/hev1 into length-prefixed form and resolved
+		// transformed Annex-B into length-prefixed form and resolved
 		// the avcC/hvcC. Before the program tables are written, drop slices that
 		// arrive before their codec config resolves: a receiver joining mid-GOP
 		// can't use them, and parking them would stop us polling for the keyframe
@@ -1157,9 +1157,9 @@ fn to_ts_timestamp(timestamp: Timestamp) -> anyhow::Result<TsTimestamp> {
 
 fn video_kind(config: &VideoConfig, name: &str) -> anyhow::Result<Kind> {
 	ensure_raw(&config.container, "video", name)?;
-	// Both in-band (avc3/hev1) and out-of-band (avc1/hvc1) are accepted:
-	// ExportSource normalizes both to length-prefixed NALU + avcC/hvcC, and the
-	// muxer rewrites them to Annex-B.
+	// Both in-band (Annex-B) and out-of-band (avcC/hvcC description) sources
+	// are accepted: ExportSource normalizes both to length-prefixed NALU +
+	// avcC/hvcC, and the muxer rewrites them to Annex-B.
 	match &config.codec {
 		VideoCodec::H264(_) => Ok(Kind::Video(StreamType::H264)),
 		VideoCodec::H265(_) => Ok(Kind::Video(StreamType::H265)),

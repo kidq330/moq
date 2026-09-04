@@ -13,6 +13,12 @@ use crate::catalog::VideoHint;
 #[non_exhaustive]
 pub struct Init {
 	/// The media format, e.g. `"avc3"`, `"opus"`, or `"aac"`.
+	///
+	/// For H.26x the token names the input framing: `"avc3"`/`"h264"` and
+	/// `"hev1"` take Annex-B input (inline parameter sets, advertised in the
+	/// catalog under the matching codec-string prefix), while `"avc1"`/`"avcc"`
+	/// and `"hvc1"`/`"hvcc"` take length-prefixed access units with the
+	/// avcC/hvcC as `data`.
 	pub format: String,
 	/// Codec init bytes. Required for audio; may be empty for a video format that resolves in band.
 	pub data: Bytes,

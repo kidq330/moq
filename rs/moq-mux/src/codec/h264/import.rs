@@ -6,9 +6,9 @@
 //! Frames arrive via [`decode`](Import::decode).
 //!
 //! The codec config comes from exactly one of two places: an avcC handed to
-//! [`initialize`](Import::initialize) (the "avc1" shape), or the SPS the splitter
-//! packages into the first keyframe (the "avc3" shape, scanned out of the frame
-//! here). A keyframe that can't be configured from either is an error;
+//! [`initialize`](Import::initialize) (the length-prefixed avc1 shape), or the
+//! SPS the splitter packages into the first keyframe (the Annex-B shape,
+//! scanned out of the frame here). A keyframe that can't be configured from either is an error;
 //! non-keyframes before the first config are tolerated (mid-stream joins).
 
 use bytes::Bytes;
@@ -24,12 +24,12 @@ use crate::container::Frame;
 /// Build it with [`new`](Self::new), passing the track producer and the
 /// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from.
 /// Feed it frames a [`Split`](super::Split) produced via [`decode`](Self::decode).
-/// The catalog rendition fills in lazily once the codec config is known (avcC via
-/// [`initialize`](Self::initialize) for avc1, the first SPS for avc3).
+/// The catalog rendition fills in lazily once the codec config is known (an avcC
+/// via [`initialize`](Self::initialize), or the first inline SPS).
 pub struct Import<E: CatalogExt = ()> {
-	/// True for the avc1 shape: the codec config is out-of-band (avcC), so
-	/// keyframes are not scanned for an inline SPS.
-	avc1: bool,
+	/// True once an avcC resolved the config: payloads are length-prefixed
+	/// NALU, so keyframes are not scanned for an inline SPS.
+	length_prefixed: bool,
 	track: crate::container::Producer<crate::catalog::hang::Container>,
 	rendition: crate::catalog::VideoTrack<E>,
 	catalog: crate::codec::video::Catalog,
@@ -53,7 +53,7 @@ impl<E: CatalogExt> Import<E> {
 		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
 		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
 		let mut import = Self {
-			avc1: false,
+			length_prefixed: false,
 			track: reserved.producer().media_producer(track, wire)?,
 			rendition,
 			catalog,
@@ -67,33 +67,33 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Resolve the codec config from the codec's leading bytes.
 	///
-	/// - **avc1** (no leading start code): parsed as an `AVCDecoderConfigurationRecord`,
+	/// - **avcC** (no leading start code): parsed as an `AVCDecoderConfigurationRecord`,
 	///   which resolves the config and is stored as the catalog `description`. Required
-	///   for avc1.
-	/// - **avc3** (leading start code): parsed as Annex-B; any SPS resolves the config.
-	///   Optional, since avc3 also self-initializes from the first keyframe.
+	///   for length-prefixed sources.
+	/// - **Annex-B** (leading start code): any SPS resolves the config.
+	///   Optional, since an Annex-B stream also self-initializes from the first keyframe.
 	///
 	/// Takes a read-only slice: the dispatcher-owned [`Split`](super::Split) is what
 	/// consumes the stream (and reads the same avcC for the NALU length size). The
 	/// shape is detected from the leading bytes.
 	pub fn initialize(&mut self, buf: &[u8]) -> Result<()> {
 		if crate::codec::annexb::is_config_record(buf) {
-			self.initialize_avc1(buf)
+			self.initialize_avcc(buf)
 		} else {
-			self.initialize_avc3(buf)
+			self.initialize_annexb(buf)
 		}
 	}
 
-	fn initialize_avc1(&mut self, avcc_bytes: &[u8]) -> Result<()> {
-		// Only switch to avc1 mode once the avcC actually parses, so a parse failure leaves the
-		// importer in avc3 mode where inline-SPS keyframes still self-initialize.
+	fn initialize_avcc(&mut self, avcc_bytes: &[u8]) -> Result<()> {
+		// Only switch to length-prefixed mode once the avcC actually parses, so a parse failure
+		// leaves the importer in Annex-B mode where inline-SPS keyframes still self-initialize.
 		let config = config_from_avcc(avcc_bytes)?;
-		self.avc1 = true;
+		self.length_prefixed = true;
 		self.apply_config(config);
 		Ok(())
 	}
 
-	fn initialize_avc3(&mut self, data: &[u8]) -> Result<()> {
+	fn initialize_annexb(&mut self, data: &[u8]) -> Result<()> {
 		// Resolve the config from any SPS in the seed buffer. Scan a clone so the
 		// caller's buffer is left intact for the splitter to consume.
 		let mut scan = Bytes::copy_from_slice(data);
@@ -171,10 +171,10 @@ impl<E: CatalogExt> Import<E> {
 		self.estimate();
 	}
 
-	/// Resolve the avc3 config from an inline SPS, updating it in place.
+	/// Resolve the config from an inline SPS, updating it in place.
 	///
-	/// avc3 carries SPS inline, so a resolution change just updates the config
-	/// (no new init segment, unlike avc1).
+	/// Annex-B carries SPS inline, so a resolution change just updates the
+	/// config (no new init segment, unlike an avcC-configured source).
 	fn configure_from_sps(&mut self, sps_nal: &Bytes) -> Result<()> {
 		if self.last_sps.as_ref() == Some(sps_nal) {
 			return Ok(());
@@ -193,13 +193,13 @@ impl<E: CatalogExt> Import<E> {
 		self.catalog.publish(&mut self.rendition, config);
 	}
 
-	/// Write split frames to the track, resolving the avc3 config from the first
-	/// keyframe's inline SPS and refining the catalog jitter as it goes.
+	/// Write split frames to the track, resolving the Annex-B config from the
+	/// first keyframe's inline SPS and refining the catalog jitter as it goes.
 	fn write_frames(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
 		for frame in frames {
-			// avc1 config arrives out-of-band via initialize(); avc3 carries SPS
-			// inline on keyframes.
-			if !self.avc1
+			// An avcC config arrives out-of-band via initialize(); Annex-B
+			// carries SPS inline on keyframes.
+			if !self.length_prefixed
 				&& frame.keyframe
 				&& let Some(sps) = find_sps(&frame.payload)
 			{
@@ -223,15 +223,15 @@ impl<E: CatalogExt> Import<E> {
 		Ok(())
 	}
 
-	/// Publish split frames, resolving the avc3 config from the first keyframe's
-	/// inline SPS and refining the catalog jitter as it goes.
+	/// Publish split frames, resolving the Annex-B config from the first
+	/// keyframe's inline SPS and refining the catalog jitter as it goes.
 	pub fn decode(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
 		self.write_frames(frames)
 	}
 }
 
 /// The catalog config a stream's codec bytes describe, resolved without publishing anything: an
-/// `AVCDecoderConfigurationRecord` (the avc1 shape) or Annex-B carrying an inline SPS (avc3).
+/// `AVCDecoderConfigurationRecord` (the avc1 shape) or Annex-B carrying an inline SPS.
 ///
 /// The video counterpart of [`opus::config`](crate::codec::opus::config), for a caller holding the
 /// bytes but no track: a publisher that wants its catalog rendition to say what its encoder really
@@ -261,8 +261,8 @@ fn config_from_avcc(avcc_bytes: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	Ok(config)
 }
 
-/// The config an inline SPS describes (`inline: true`, the avc3 shape). No `description`: the
-/// parameter sets ride with every keyframe.
+/// The config an inline SPS describes (`inline: true`; the catalog advertises the avc3 prefix).
+/// No `description`: the parameter sets ride with every keyframe.
 fn config_from_sps(sps_nal: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	let sps = Sps::parse(sps_nal)?;
 
@@ -333,10 +333,10 @@ mod tests {
 		assert_eq!(cfg.description.as_ref().expect("description").as_ref(), avcc.as_slice());
 	}
 
-	/// An avc3 stream self-initializes: the config is resolved from the SPS the
-	/// splitter packages into the first keyframe.
+	/// An Annex-B stream self-initializes: the config is resolved from the SPS
+	/// the splitter packages into the first keyframe.
 	#[tokio::test(start_paused = true)]
-	async fn avc3_self_initializes_from_first_keyframe() {
+	async fn annexb_self_initializes_from_first_keyframe() {
 		let sps: &[u8] = &[
 			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
 			0x01, 0xd4, 0xc0, 0x80,
@@ -368,8 +368,11 @@ mod tests {
 		let hang::catalog::VideoCodec::H264(h264) = &h264_cfg.codec else {
 			panic!("expected H.264 codec")
 		};
-		assert!(h264.inline, "avc3 source should land as inline=true");
-		assert!(h264_cfg.description.is_none(), "avc3 has no out-of-band description");
+		assert!(h264.inline, "an Annex-B source should land as inline=true");
+		assert!(
+			h264_cfg.description.is_none(),
+			"in-band config has no out-of-band description"
+		);
 		assert_eq!(h264.profile, sps[1]);
 		assert_eq!(h264.level, sps[3]);
 	}
@@ -412,7 +415,7 @@ mod tests {
 		let hang::catalog::VideoCodec::H264(h264) = &h264_cfg.codec else {
 			panic!("expected H.264 codec")
 		};
-		assert!(h264.inline, "avc3 source should land as inline=true");
+		assert!(h264.inline, "an Annex-B source should land as inline=true");
 		assert_eq!(h264.profile, sps[1]);
 		assert_eq!(h264.level, sps[3]);
 	}
