@@ -11,8 +11,14 @@ use crate::Error;
 /// whether parameter sets are included in-band (hev1) or out-of-band (hvc1).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct H265 {
-	/// If true (hev1), then the SPS/PPS/etc are in the same NAL unit as the IDR.
-	/// If false (hvc1), then the SPS/PPS/etc are in the description.
+	/// Where the parameter sets live, which selects the codec-string prefix.
+	///
+	/// If true, VPS/SPS/PPS ride in-band with each keyframe and a raw
+	/// (non-CMAF) frame payload is an Annex-B access unit; the codec string
+	/// uses the `hev1` prefix. If false, they live in the hvcC `description`
+	/// and a raw payload is length-prefixed NALU per its length size; the
+	/// prefix is `hvc1`. WebCodecs consumers select the framing from the
+	/// presence of `description`, matching this convention.
 	pub in_band: bool,
 
 	/// Profile space (0 for main profile space, 1-3 for other spaces)

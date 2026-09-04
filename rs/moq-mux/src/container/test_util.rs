@@ -31,7 +31,8 @@ impl Live {
 		}
 	}
 
-	/// One Avc3-shape H.264 rendition (320x240 at 30 fps).
+	/// One in-band (Annex-B) H.264 rendition (320x240 at 30 fps), advertised
+	/// with the avc3 codec-string prefix.
 	pub(crate) fn avc3() -> Self {
 		Self::new(".avc3", |catalog, name| {
 			let mut config = VideoConfig::new(H264 {

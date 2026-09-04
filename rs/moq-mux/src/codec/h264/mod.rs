@@ -5,7 +5,7 @@
 //! (inline SPS/PPS) as length-prefixed NALU + out-of-band avcC, which is
 //! what every CMAF and MKV consumer expects. [`Export`] subscribes to a
 //! catalog-narrowed H.264 rendition and emits an Annex-B elementary
-//! stream; [`Split`] does the byte-level framing for the Annex-B (avc3)
+//! stream; [`Split`] does the byte-level framing for the Annex-B
 //! wire shape and [`Import`] is the pure frame publisher that resolves the
 //! catalog. avc1 (length-prefixed NALU) has no stream framing; wrap one
 //! access unit with `avc1_frame`.
@@ -330,8 +330,8 @@ fn read_param_set_array(buf: &[u8], mut pos: usize, count: usize, params: &mut V
 	Ok(pos)
 }
 
-/// Transform H.264 frames from Annex-B (inline SPS/PPS, "avc3") to
-/// length-prefixed NALU (out-of-band AVCDecoderConfigurationRecord, "avc1").
+/// Transform H.264 frames from Annex-B (inline SPS/PPS) to length-prefixed
+/// NALU with an out-of-band AVCDecoderConfigurationRecord (the avc1 shape).
 ///
 /// The avcC is synthesized from the active SPS+PPS and exposed via
 /// [`Self::avcc`]. Once it returns `Some`, all subsequent calls to
@@ -356,7 +356,7 @@ impl Default for Avc1 {
 }
 
 impl Avc1 {
-	/// Build a new transform for an avc3 source.
+	/// Build a new transform for an Annex-B source.
 	pub fn new() -> Self {
 		Self {
 			avcc: None,
@@ -511,7 +511,7 @@ mod tests {
 	}
 
 	#[test]
-	fn avc3_strips_sps_pps_and_builds_avcc() {
+	fn annexb_strips_sps_pps_and_builds_avcc() {
 		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
 		let pps = &[0x68, 0xce, 0x3c, 0x80][..];
 		let idr = &[0x65, 0x88, 0x84, 0x21][..];
@@ -564,7 +564,7 @@ mod tests {
 	}
 
 	#[test]
-	fn avc3_keyframe_with_two_pps_keeps_both() {
+	fn annexb_keyframe_with_two_pps_keeps_both() {
 		// One keyframe carrying both PPS: the synthesized avcC keeps both, in order.
 		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
 		let pps0 = &[0x68, 0xce, 0x3c, 0x80][..];
@@ -583,7 +583,7 @@ mod tests {
 	}
 
 	#[test]
-	fn avc3_reinit_drops_superseded_pps() {
+	fn annexb_reinit_drops_superseded_pps() {
 		// A later keyframe presents a different PPS set: the avcC adopts the new set
 		// and drops the old one rather than accumulating both forever.
 		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
@@ -605,7 +605,7 @@ mod tests {
 	}
 
 	#[test]
-	fn avc3_parameter_only_frame_returns_none() {
+	fn annexb_parameter_only_frame_returns_none() {
 		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
 		let pps = &[0x68, 0xce, 0x3c, 0x80][..];
 
@@ -616,7 +616,7 @@ mod tests {
 	}
 
 	#[test]
-	fn avc3_subsequent_frame_uses_cached_avcc() {
+	fn annexb_subsequent_frame_uses_cached_avcc() {
 		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
 		let pps = &[0x68, 0xce, 0x3c, 0x80][..];
 		let idr = &[0x65, 0x88][..];
@@ -635,7 +635,7 @@ mod tests {
 	}
 
 	#[test]
-	fn avc3_export_e2e_payload_shape() {
+	fn annexb_export_e2e_payload_shape() {
 		// Mirror the byte shapes used by the export integration test so any
 		// divergence surfaces here in isolation.
 		let sps = &[0x67u8, 0x42, 0xc0, 0x1f, 0xde, 0xad, 0xbe, 0xef][..];

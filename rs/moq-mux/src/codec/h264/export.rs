@@ -6,11 +6,11 @@
 //! (timestamps are dropped).
 //!
 //! Two source shapes are accepted:
-//! - **avc3** (catalog `description` empty): payload is already Annex-B with
-//!   SPS/PPS inline. Pass through unchanged.
-//! - **avc1** (catalog `description` is the avcC): length-prefixed NALUs.
-//!   Length prefixes are replaced with `00 00 00 01` start codes; SPS/PPS
-//!   extracted from the avcC are injected ahead of every keyframe.
+//! - **in-band** (catalog `description` empty): payload is already Annex-B
+//!   with SPS/PPS inline. Pass through unchanged.
+//! - **out-of-band** (catalog `description` is the avcC): length-prefixed
+//!   NALUs. Length prefixes are replaced with `00 00 00 01` start codes;
+//!   SPS/PPS extracted from the avcC are injected ahead of every keyframe.
 
 use std::task::{Poll, ready};
 use std::time::Duration;
@@ -39,9 +39,9 @@ struct H264Track {
 	/// silently reusing a stale `convert`.
 	config: VideoConfig,
 	source: ExportSource,
-	/// `Some` for an avc1 source: SPS/PPS prefix prebuilt from the avcC, and
-	/// the avcC length-prefix size. `None` for an avc3 source: Annex-B passes
-	/// through without conversion.
+	/// `Some` for a length-prefixed source: SPS/PPS prefix prebuilt from the
+	/// avcC, and the avcC length-prefix size. `None` for an Annex-B source,
+	/// which passes through without conversion.
 	convert: Option<Avc1Convert>,
 }
 

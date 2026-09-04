@@ -454,7 +454,7 @@ async fn export_rejects_cmaf_track() {
 
 #[tokio::test(start_paused = true)]
 async fn export_avc3_source_synthesizes_avcc_and_length_prefixes() {
-	// Avc3-shape source: frames in Annex-B with inline SPS+PPS before keyframes.
+	// Annex-B source: frames with inline SPS+PPS before keyframes.
 	// The exporter must (a) defer the header until SPS+PPS arrive, (b) emit avcC
 	// in CodecPrivate, (c) length-prefix the sample bytes in each SimpleBlock.
 

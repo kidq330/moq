@@ -1,7 +1,7 @@
 //! H.264 Annex-B stream splitter.
 //!
-//! [`Split`] turns a raw H.264 Annex-B byte stream (inline SPS/PPS, the "avc3"
-//! wire shape) into [`crate::container::Frame`]s. It finds access-unit
+//! [`Split`] turns a raw H.264 Annex-B byte stream (inline SPS/PPS) into
+//! [`crate::container::Frame`]s. It finds access-unit
 //! boundaries, caches SPS/PPS and re-inserts them ahead of each keyframe so
 //! every keyframe is self-contained, and stamps wall-clock timestamps when the
 //! caller has none (stdin).
@@ -30,7 +30,7 @@ pub struct Split {
 	/// [`decode`](Self::decode), leaving the in-flight (final, not-yet-terminated)
 	/// NAL here until the next start code arrives or [`flush`](Self::flush) drains it.
 	tail: BytesMut,
-	current: Avc3Frame,
+	current: Au,
 	/// Retained SPS NALs from the latest keyframe that carried them, re-injected
 	/// on bare keyframes. Replaced (not accumulated) when a keyframe presents a
 	/// different set, so a mid-stream reinit drops the superseded ones.
@@ -43,7 +43,7 @@ pub struct Split {
 }
 
 #[derive(Default)]
-struct Avc3Frame {
+struct Au {
 	chunks: BytesMut,
 	contains_idr: bool,
 	/// A recovery-point SEI was seen in this access unit: an open-GOP random
@@ -68,7 +68,7 @@ impl Split {
 	pub fn new() -> Self {
 		Self {
 			tail: BytesMut::new(),
-			current: Avc3Frame::default(),
+			current: Au::default(),
 			sps: Vec::new(),
 			pps: Vec::new(),
 			zero: None,
@@ -122,23 +122,23 @@ impl Split {
 		}
 
 		let nal_unit_type = header & 0b11111;
-		let nal_type = Avc3NalType::try_from(nal_unit_type).ok();
+		let nal_type = NalType::try_from(nal_unit_type).ok();
 
 		match nal_type {
-			Some(Avc3NalType::Sps) => {
+			Some(NalType::Sps) => {
 				self.maybe_start_frame(pts)?;
 				// Track only what this AU carries; the retained set is reconciled at
 				// the keyframe so a new GOP's set replaces (not accumulates onto) it.
 				crate::codec::annexb::push_distinct(&mut self.current.sps_seen, &nal);
 			}
-			Some(Avc3NalType::Pps) => {
+			Some(NalType::Pps) => {
 				self.maybe_start_frame(pts)?;
 				crate::codec::annexb::push_distinct(&mut self.current.pps_seen, &nal);
 			}
-			Some(Avc3NalType::Aud) => {
+			Some(NalType::Aud) => {
 				self.maybe_start_frame(pts)?;
 			}
-			Some(Avc3NalType::Sei) => {
+			Some(NalType::Sei) => {
 				self.maybe_start_frame(pts)?;
 				// SEI precedes the slice in an access unit, so a recovery-point
 				// message here flags the coming I-slice as a random access point.
@@ -146,7 +146,7 @@ impl Split {
 					self.current.contains_recovery_point = true;
 				}
 			}
-			Some(Avc3NalType::IdrSlice) => {
+			Some(NalType::IdrSlice) => {
 				// first_mb_in_slice == 0 (ue(v), so the byte-after-header high bit is set)
 				// marks the first slice of a new picture: close any access unit still open.
 				// A bare IDR arriving right after a delta picture in the same chunk would
@@ -160,10 +160,10 @@ impl Split {
 				self.current.contains_idr = true;
 				self.current.contains_slice = true;
 			}
-			Some(Avc3NalType::NonIdrSlice)
-			| Some(Avc3NalType::DataPartitionA)
-			| Some(Avc3NalType::DataPartitionB)
-			| Some(Avc3NalType::DataPartitionC) => {
+			Some(NalType::NonIdrSlice)
+			| Some(NalType::DataPartitionA)
+			| Some(NalType::DataPartitionB)
+			| Some(NalType::DataPartitionC) => {
 				if nal.get(1).ok_or(Error::NalTooShort)? & 0x80 != 0 {
 					self.maybe_start_frame(pts)?;
 				}
@@ -230,7 +230,7 @@ impl Split {
 	/// timestamp. The parameter-set cache is kept so subsequent keyframes stay
 	/// self-contained.
 	pub fn reset(&mut self) {
-		self.current = Avc3Frame::default();
+		self.current = Au::default();
 		self.tail.clear();
 	}
 
@@ -260,7 +260,7 @@ fn sei_has_recovery_point(nal: &[u8]) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive)]
 #[repr(u8)]
-enum Avc3NalType {
+enum NalType {
 	Unspecified = 0,
 	NonIdrSlice = 1,
 	DataPartitionA = 2,

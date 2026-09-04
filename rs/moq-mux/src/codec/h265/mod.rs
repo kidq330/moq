@@ -4,8 +4,8 @@
 //! and HEVCDecoderConfigurationRecord blobs. The [`Hvc1`] transmuxer
 //! rewrites Annex-B input (inline VPS/SPS/PPS) as length-prefixed NALU
 //! + out-of-band hvcC. [`Export`] is the single-rendition Annex-B
-//!   exporter; [`Import`] takes either shape, driven by a
-//!   [`Split`] for hev1 or by `hvc1_frame` for hvc1.
+//!   exporter; [`Import`] takes either shape, driven by a [`Split`] for
+//!   Annex-B or by `hvc1_frame` for length-prefixed NALU.
 
 mod export;
 mod import;
@@ -238,7 +238,7 @@ impl Default for Hvc1 {
 }
 
 impl Hvc1 {
-	/// Build a new transform for a hev1 source.
+	/// Build a new transform for an Annex-B source.
 	pub fn new() -> Self {
 		Self {
 			hvcc: None,

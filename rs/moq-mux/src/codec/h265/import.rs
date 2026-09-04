@@ -1,13 +1,13 @@
 //! H.265 importer.
 //!
 //! Publishes H.265 frames on a single moq track and resolves the catalog
-//! rendition, in either wire shape: Annex-B with inline VPS/SPS/PPS ("hev1"), or
-//! length-prefixed NALU with an out-of-band hvcC ("hvc1"). Only single-layer
-//! streams are supported (VPS is cached but not parsed).
+//! rendition, in either wire shape: Annex-B with inline VPS/SPS/PPS, or
+//! length-prefixed NALU with an out-of-band hvcC (the hvc1 shape). Only
+//! single-layer streams are supported (VPS is cached but not parsed).
 //!
 //! The codec config comes from exactly one of two places: an hvcC handed to
-//! [`initialize`](Import::initialize) (the hvc1 shape), or the SPS the splitter
-//! packages into the first keyframe (hev1). A keyframe
+//! [`initialize`](Import::initialize) (the length-prefixed shape), or the SPS
+//! the splitter packages into the first keyframe (Annex-B). A keyframe
 //! that can't be configured is an error; non-keyframes before the first config
 //! are written through to the producer, which reports
 //! [`MissingKeyframe`](crate::container::MissingKeyframe) for a mid-stream join.
@@ -29,12 +29,12 @@ use crate::container::Frame;
 /// Build it with [`new`](Self::new), passing the track producer and the
 /// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from, and feed it
 /// frames a [`Split`](super::Split) produced via [`decode`](Self::decode). The
-/// catalog rendition fills in lazily once the codec config is known (hvcC via
-/// [`initialize`](Self::initialize) for hvc1, the first SPS for hev1).
+/// catalog rendition fills in lazily once the codec config is known (an hvcC
+/// via [`initialize`](Self::initialize), or the first inline SPS).
 pub struct Import<E: CatalogExt = ()> {
-	/// True for the hvc1 shape: the codec config is out-of-band (hvcC), so
-	/// frame payloads are length-prefixed rather than Annex-B and are never scanned.
-	hvc1: bool,
+	/// True once an hvcC resolved the config: payloads are length-prefixed
+	/// NALU and are never scanned for an inline SPS.
+	length_prefixed: bool,
 	track: crate::container::Producer<crate::catalog::hang::Container>,
 	rendition: crate::catalog::VideoTrack<E>,
 	catalog: crate::codec::video::Catalog,
@@ -58,7 +58,7 @@ impl<E: CatalogExt> Import<E> {
 		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
 		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
 		let mut import = Self {
-			hvc1: false,
+			length_prefixed: false,
 			track: reserved.producer().media_producer(track, wire)?,
 			rendition,
 			catalog,
@@ -72,34 +72,34 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Resolve the codec config from the codec's leading bytes.
 	///
-	/// - **hvc1** (no leading start code): parsed as an `HEVCDecoderConfigurationRecord`,
+	/// - **hvcC** (no leading start code): parsed as an `HEVCDecoderConfigurationRecord`,
 	///   which resolves the config and is stored as the catalog `description`. Required
-	///   for hvc1.
-	/// - **hev1** (leading start code): parsed as Annex-B; any SPS resolves the config.
-	///   Optional, since hev1 also self-initializes from the first keyframe.
+	///   for length-prefixed sources.
+	/// - **Annex-B** (leading start code): any SPS resolves the config.
+	///   Optional, since an Annex-B stream also self-initializes from the first keyframe.
 	///
 	/// Takes a read-only slice: the dispatcher-owned [`Split`](super::Split) is what
 	/// consumes the stream (and reads the same hvcC for the NALU length size). The
 	/// shape is detected from the leading bytes.
 	pub fn initialize(&mut self, buf: &[u8]) -> Result<()> {
 		if crate::codec::annexb::is_config_record(buf) {
-			self.initialize_hvc1(buf)
+			self.initialize_hvcc(buf)
 		} else {
-			self.initialize_hev1(buf)
+			self.initialize_annexb(buf)
 		}
 	}
 
-	fn initialize_hvc1(&mut self, hvcc_bytes: &[u8]) -> Result<()> {
-		// Only switch to hvc1 mode once the hvcC actually parses, so a parse failure leaves the
-		// importer in hev1 mode where inline-SPS keyframes still self-initialize.
+	fn initialize_hvcc(&mut self, hvcc_bytes: &[u8]) -> Result<()> {
+		// Only switch to length-prefixed mode once the hvcC actually parses, so a parse failure
+		// leaves the importer in Annex-B mode where inline-SPS keyframes still self-initialize.
 		let config = super::config_from_hvcc(hvcc_bytes)?;
-		self.hvc1 = true;
+		self.length_prefixed = true;
 		self.apply_config(config);
 		Ok(())
 	}
 
 	/// Resolve the config from any SPS in the buffer.
-	fn initialize_hev1(&mut self, buf: &[u8]) -> Result<()> {
+	fn initialize_annexb(&mut self, buf: &[u8]) -> Result<()> {
 		let mut scan = Bytes::copy_from_slice(buf);
 		let mut nals = NalIterator::new(&mut scan);
 		while let Some(nal) = nals.next().transpose()? {
@@ -199,10 +199,10 @@ impl<E: CatalogExt> Import<E> {
 	/// keyframe's inline SPS and refining the catalog jitter as it goes.
 	fn write_frames(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
 		for frame in frames {
-			// hvc1 config arrives out-of-band via initialize(); hev1 carries SPS inline on
-			// keyframes. Scanning an hvc1 payload would misread a length prefix as a start
-			// code (a 322-byte NAL prefixes as `00 00 01 42`, an SPS NAL header).
-			if !self.hvc1
+			// An hvcC config arrives out-of-band via initialize(); Annex-B carries SPS inline
+			// on keyframes. Scanning a length-prefixed payload would misread a length prefix as
+			// a start code (a 322-byte NAL prefixes as `00 00 01 42`, an SPS NAL header).
+			if !self.length_prefixed
 				&& frame.keyframe
 				&& let Some(sps) = find_sps(&frame.payload)
 			{
@@ -231,7 +231,7 @@ impl<E: CatalogExt> Import<E> {
 }
 
 /// The catalog config a stream's codec bytes describe, resolved without publishing anything: an
-/// `HEVCDecoderConfigurationRecord` (the hvc1 shape) or Annex-B carrying an inline SPS (hev1).
+/// `HEVCDecoderConfigurationRecord` (the hvc1 shape) or Annex-B carrying an inline SPS.
 ///
 /// The H.265 counterpart of [`h264::config`](crate::codec::h264::config).
 pub fn config(buf: &[u8]) -> Result<hang::catalog::VideoConfig> {
@@ -242,15 +242,15 @@ pub fn config(buf: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	config_from_sps(&sps)
 }
 
-/// The config an inline SPS describes (`in_band: true`, the hev1 shape). No `description`: the
-/// parameter sets ride with every keyframe.
+/// The config an inline SPS describes (`in_band: true`; the catalog advertises the hev1 prefix).
+/// No `description`: the parameter sets ride with every keyframe.
 fn config_from_sps(sps_nal: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	let sps = SpsNALUnit::parse(&mut &sps_nal[..]).map_err(|_| Error::SpsParse)?;
 	let profile = &sps.rbsp.profile_tier_level.general_profile;
 	let vui_data = sps.rbsp.vui_parameters.as_ref().map(VuiData::new).unwrap_or_default();
 
 	let mut config = hang::catalog::VideoConfig::new(hang::catalog::H265 {
-		in_band: true, // An inline SPS is the hev1 shape; hvc1 configs come from `config_from_hvcc`.
+		in_band: true, // An inline SPS is the in-band shape; out-of-band configs come from `config_from_hvcc`.
 		profile_space: profile.profile_space,
 		profile_idc: profile.profile_idc,
 		profile_compatibility_flags: profile.profile_compatibility_flag.bits().to_be_bytes(),
@@ -417,10 +417,10 @@ mod tests {
 		assert_eq!(cfg.description.as_deref(), Some(hvcc.as_ref()));
 	}
 
-	/// A hev1 stream self-initializes: the config is resolved from the SPS the
-	/// splitter packages into the first keyframe.
+	/// An Annex-B stream self-initializes: the config is resolved from the SPS
+	/// the splitter packages into the first keyframe.
 	#[tokio::test(start_paused = true)]
-	async fn hev1_self_initializes_from_first_keyframe() {
+	async fn annexb_self_initializes_from_first_keyframe() {
 		let idr: &[u8] = &[0x26, 0x01, 0x80, 0xaa]; // IdrWRadl (19)
 		let mut annexb = BytesMut::new();
 		for nal in [fixtures::VPS, fixtures::SPS, fixtures::PPS, idr] {
@@ -446,8 +446,11 @@ mod tests {
 		let hang::catalog::VideoCodec::H265(h265) = &cfg.codec else {
 			panic!("expected H.265 codec")
 		};
-		assert!(h265.in_band, "hev1 source should land as in_band=true");
-		assert!(cfg.description.is_none(), "hev1 has no out-of-band description");
+		assert!(h265.in_band, "an Annex-B source should land as in_band=true");
+		assert!(
+			cfg.description.is_none(),
+			"in-band config has no out-of-band description"
+		);
 		assert_eq!(cfg.coded_width, Some(1280));
 		assert_eq!(cfg.coded_height, Some(720));
 	}

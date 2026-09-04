@@ -182,7 +182,7 @@ impl<S: Stream> Export<S> {
 		}
 
 		// 2. Fill any empty pending slots by polling each source. ExportSource
-		// has already applied any codec-shape transform (Avc3 → avc1) and
+		// has already applied any codec-shape transform (Annex-B to length-prefixed) and
 		// absorbed parameter-only frames.
 		//
 		// Pre-init: drop slices that arrived before this track's codec config
@@ -222,7 +222,7 @@ impl<S: Stream> Export<S> {
 
 		// 3. Build and emit the init segment once every source has resolved
 		// its codec config (immediately for CMAF-passthrough sources;
-		// after the first keyframe for Avc3/Hev1 sources).
+		// after the first keyframe for Annex-B sources).
 		if !self.init_emitted {
 			if self.init_ready() {
 				let init = self.build_init()?;

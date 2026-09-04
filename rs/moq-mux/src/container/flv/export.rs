@@ -6,7 +6,7 @@
 //! the classic CodecID tags; HEVC, AV1, VP9, Opus, AC-3, and E-AC-3 are muxed as
 //! the enhanced-RTMP (E-RTMP) FourCC payloads. Frames flow through [`ExportSource`],
 //! which normalizes H.264/H.265 to length-prefixed NALU plus a resolved
-//! avcC/hvcC (parsing inline avc3/hev1 parameter sets when needed) and hands the
+//! avcC/hvcC (parsing inline Annex-B parameter sets when needed) and hands the
 //! other codecs through unchanged.
 //!
 //! By default FLV carries a single video and a single audio stream, so only the
@@ -93,7 +93,7 @@ impl Flavor {
 /// header followed by the AVC/AAC sequence headers; each subsequent chunk is the
 /// tag for one media frame. Returns `None` when the broadcast ends.
 ///
-/// ## Avc3 sources
+/// ## Annex-B sources
 ///
 /// Annex-B H.264 (`H264 { inline: true }`, empty `description`) is accepted: an
 /// [`Avc1`](crate::codec::h264::Avc1) transform caches the inline SPS/PPS, builds
@@ -401,7 +401,7 @@ impl Export {
 
 	/// Header is ready once at least one track is bound and every bound track's
 	/// [`ExportSource`] has resolved its codec config (from the catalog
-	/// `description` or synthesized by the Avc3 transform).
+	/// `description` or synthesized by the Annex-B transform).
 	fn header_ready(&self) -> bool {
 		self.has_tracks() && self.tracks().all(|t| t.source.header_ready())
 	}

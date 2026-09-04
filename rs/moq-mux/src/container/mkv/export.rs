@@ -32,7 +32,7 @@ const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 /// duration for downstream consumers that throttle by fragment rate.
 /// Returns `None` when the broadcast ends.
 ///
-/// ## Avc3 / Hev1 sources
+/// ## Annex-B sources
 ///
 /// `Export` accepts Annex-B sources (`H264 { inline: true }`, `H265 { in_band: true }`,
 /// catalog `description` empty) by attaching a [`crate::codec::h264::Avc1`] /
@@ -211,7 +211,7 @@ impl<S: Stream> Export<S> {
 		}
 
 		// 2. Pull frames from each track into `pending`. ExportSource has
-		// already transformed Annex-B payloads (Avc3/Hev1) into length-prefixed
+		// already transformed Annex-B payloads into length-prefixed
 		// form and absorbed any parameter-only frames before returning.
 		//
 		// Pre-header: drop slices that arrived before this track's codec config
@@ -560,7 +560,7 @@ fn build_video_track_entry(
 	description: Option<&Bytes>,
 ) -> Result<MatroskaSpec> {
 	// The description came from either the catalog (avc1/hvc1 sources) or
-	// the codec transform (Avc3/Hev1 sources synthesizing it from inline params).
+	// the codec transform (Annex-B sources synthesize it from inline params).
 	let codec_private = description.map(|b| b.to_vec());
 
 	let (codec_id, codec_private) = match &config.codec {

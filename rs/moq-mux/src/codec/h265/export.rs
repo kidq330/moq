@@ -1,9 +1,8 @@
 //! H.265 single-rendition Annex-B exporter.
 //!
-//! HEVC analogue of [`crate::codec::h264::Export`]. Accepts either a hev1
-//! (Annex-B, parameter sets inline) or hvc1 (length-prefixed + out-of-band
-//! hvcC) source and emits a raw Annex-B elementary stream. Timestamps are
-//! dropped.
+//! HEVC analogue of [`crate::codec::h264::Export`]. Accepts either an Annex-B
+//! (parameter sets inline) or a length-prefixed (out-of-band hvcC) source and
+//! emits a raw Annex-B elementary stream. Timestamps are dropped.
 
 use std::task::{Poll, ready};
 use std::time::Duration;
@@ -32,9 +31,9 @@ struct H265Track {
 	/// silently reusing a stale `convert`.
 	config: VideoConfig,
 	source: ExportSource,
-	/// `Some` for an hvc1 source: VPS/SPS/PPS prefix prebuilt from the hvcC,
-	/// and the hvcC length-prefix size. `None` for a hev1 source: Annex-B
-	/// passes through without conversion.
+	/// `Some` for a length-prefixed source: VPS/SPS/PPS prefix prebuilt from
+	/// the hvcC, and the hvcC length-prefix size. `None` for an Annex-B
+	/// source, which passes through without conversion.
 	convert: Option<Hvc1Convert>,
 }
 

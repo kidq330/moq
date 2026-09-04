@@ -12,8 +12,14 @@ use crate::Error;
 #[serde_with::serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct H264 {
-	/// If true, SPS/PPS are inline in the bitstream (avc3).
-	/// If false, they must be in the description (avc1).
+	/// Where the parameter sets live, which selects the codec-string prefix.
+	///
+	/// If true, SPS/PPS ride in-band with each keyframe and a raw (non-CMAF)
+	/// frame payload is an Annex-B access unit; the codec string uses the
+	/// `avc3` prefix. If false, SPS/PPS live in the avcC `description` and a
+	/// raw payload is length-prefixed NALU per its length size; the prefix is
+	/// `avc1`. WebCodecs consumers select the framing from the presence of
+	/// `description`, matching this convention.
 	#[serde(default)]
 	pub inline: bool,
 	/// The H.264 profile (e.g., 0x42 for Baseline, 0x4D for Main, 0x64 for High)
