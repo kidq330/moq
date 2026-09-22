@@ -26,6 +26,7 @@ mod fetch_only;
 mod finished_broadcast_mock;
 mod finite_relay;
 mod goaway;
+mod goaway_mid_group;
 mod group_order;
 mod head_fetch;
 mod history_groups;

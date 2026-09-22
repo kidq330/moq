@@ -15,6 +15,7 @@ mod connection;
 mod drain;
 mod embed;
 mod goaway_cluster;
+mod goaway_mid_group;
 mod hidden_cluster;
 mod lan_mesh;
 mod logs;
