@@ -15,7 +15,10 @@
 use std::{
 	future::Future,
 	pin::Pin,
-	sync::{Arc, Mutex},
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicBool, Ordering},
+	},
 	task::{Context, Poll},
 	time::Duration,
 };
@@ -152,7 +155,7 @@ impl poll::SendStream for MockSendStream {
 			// A FIN that never left must not look acknowledged: poll_closed
 			// trusts this signal ahead of the connection error.
 			let pushed = self.push(StreamChunk::Fin);
-			if pushed.is_ok() && self.ack_fin {
+			if pushed.is_ok() && (self.ack_fin || self.conn.ack_fins.load(Ordering::Relaxed)) {
 				self.closed.set(Ok(()));
 			}
 			self.tx = None;
@@ -362,6 +365,8 @@ struct ConnectionState {
 	latency: Mutex<Duration>,
 	/// Wakes both sides when close_state is populated.
 	waiters: kio::Fan,
+	/// Acknowledge every FIN as soon as it is sent (see [`MockSession::ack_fins`]).
+	ack_fins: AtomicBool,
 }
 
 impl ConnectionState {
@@ -562,6 +567,15 @@ impl poll::Session for MockSession {
 // Only some test binaries steer delivery.
 #[allow(dead_code)]
 impl MockSession {
+	/// Acknowledge every FIN sent from now on, on either side, as soon as it is sent.
+	///
+	/// A real transport acknowledges what it received, not what its application read. By
+	/// default the mock acknowledges a FIN once the peer's application is done with the
+	/// stream.
+	pub fn ack_fins(&self) {
+		self.side.conn.ack_fins.store(true, Ordering::Relaxed);
+	}
+
 	/// Hold back the uni streams this side opens from now on.
 	///
 	/// The peer's transport has them, so a FIN is acknowledged at once, but its application
