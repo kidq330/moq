@@ -1,0 +1,202 @@
+diff --git a/rs/moq-net/Cargo.toml b/rs/moq-net/Cargo.toml
+index 967afb259..bba0ed245 100644
+--- a/rs/moq-net/Cargo.toml
++++ b/rs/moq-net/Cargo.toml
+@@ -36,6 +36,7 @@ web-async = { workspace = true }
+ web-transport-trait = { workspace = true }
+ 
+ [dev-dependencies]
++tracing-subscriber = { workspace = true }
+ criterion = { workspace = true }
+ serde_json = { workspace = true }
+ # test-util (tokio::time::pause/advance) is test-only and is NOT supported on
+diff --git a/rs/moq-net/src/lite/subscriber.rs b/rs/moq-net/src/lite/subscriber.rs
+index 68b2e34e2..05e3e8a5f 100644
+--- a/rs/moq-net/src/lite/subscriber.rs
++++ b/rs/moq-net/src/lite/subscriber.rs
+@@ -3232,6 +3232,7 @@ impl<S: crate::transport::poll::Session> Establish<S> {
+ 						start_frame: bounds.start_frame,
+ 						end_frame: bounds.end_frame,
+ 					};
++					eprintln!("DBG SUBSCRIBE sent id={} start_group={:?} start_frame={:?} end_group={:?} (subscription.start={:?})", msg.id, msg.start_group, msg.start_frame, msg.end_group, self.subscription.start);
+ 					stream.writer.buffer(&lite::ControlType::Subscribe)?;
+ 					stream.writer.buffer(&msg)?;
+ 					self.state = EstablishState::Send { stream };
+diff --git a/rs/moq-net/tests/resub_probe.rs b/rs/moq-net/tests/resub_probe.rs
+new file mode 100644
+index 000000000..73a552222
+--- /dev/null
++++ b/rs/moq-net/tests/resub_probe.rs
+@@ -0,0 +1,172 @@
++//! Scratch probe: what a subscription that starts at an older, still-open group gets,
++//! and what a resubscribe gets, over mock sessions.
++
++mod support;
++
++use std::time::Duration;
++
++use moq_net::{Hop, Timestamp, Version};
++use support::harness::{MockConnectOptions, connect_mock};
++
++const TIMEOUT: Duration = Duration::from_secs(10);
++
++fn produce_origin(hop: u64) -> moq_net::origin::Producer {
++	let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::new(Hop::new(hop).unwrap()));
++	tokio::spawn(support::harness::run(driver));
++	producer
++}
++
++fn write(group: &mut moq_net::group::Producer, sequence: u64, indices: std::ops::Range<u64>) {
++	for index in indices {
++		let ts = Timestamp::from_micros(sequence * 1_000_000 + index * 33_000).unwrap();
++		group.write_frame(ts, vec![sequence as u8, index as u8]).unwrap();
++	}
++}
++
++/// Read everything that arrives until nothing does for `quiet`, reading groups
++/// concurrently so a stalled group does not hide the others.
++type Chan = (tokio::sync::mpsc::UnboundedSender<String>, tokio::sync::mpsc::UnboundedReceiver<String>);
++
++async fn drain(sub: &mut moq_net::track::Subscriber, chan: &mut Chan, quiet: Duration) -> Vec<String> {
++	let (tx, rx) = chan;
++	let mut out = Vec::new();
++	loop {
++		tokio::select! {
++			group = sub.recv_group() => match group {
++				Ok(Some(mut group)) => {
++					let tx = tx.clone();
++					let _ = tx.send(format!("g{}:open", group.sequence));
++					tokio::spawn(async move {
++						loop {
++							match group.read_frame().await {
++								Ok(Some(f)) => { let _ = tx.send(format!("{}/{}", f.payload[0], f.payload[1])); }
++								Ok(None) => { let _ = tx.send(format!("g{}:end", group.sequence)); break; }
++								Err(e) => { let _ = tx.send(format!("g{}:err({e})", group.sequence)); break; }
++							}
++						}
++					});
++				}
++				Ok(None) => { out.push("track:end".into()); break; }
++				Err(e) => { out.push(format!("track:err({e})")); break; }
++			},
++			Some(ev) = rx.recv() => out.push(ev),
++			_ = tokio::time::sleep(quiet) => break,
++		}
++	}
++	while let Ok(ev) = rx.try_recv() {
++		out.push(ev);
++	}
++	out
++}
++
++fn summarize(events: &[String]) -> String {
++	let mut per: std::collections::BTreeMap<String, usize> = Default::default();
++	let mut marks = Vec::new();
++	for e in events {
++		if let Some((g, _)) = e.split_once('/') {
++			*per.entry(format!("g{g}")).or_default() += 1;
++		} else {
++			marks.push(e.clone());
++		}
++	}
++	format!("frames {per:?} marks {marks:?}")
++}
++
++async fn round(version: &str, hops: usize, first_start: u64, info: bool) {
++	let version: Version = version.parse().unwrap();
++	let publisher = produce_origin(1);
++	let broadcast = publisher.create_broadcast("bcast").unwrap();
++	let track = if info {
++		let info = moq_net::track::Info::default()
++			.with_timescale(moq_net::Timescale::MICRO)
++			.with_max_age(Duration::from_secs(30))
++			.with_priority(100);
++		broadcast.create_track("video", info).unwrap()
++	} else {
++		broadcast.create_track("video", None).unwrap()
++	};
++	broadcast.announce(Default::default()).unwrap();
++
++	let mut pairs = Vec::new();
++	let mut upstream = publisher.clone();
++	let mut keep = Vec::new();
++	for hop in 0..hops {
++		let next = produce_origin(2 + hop as u64);
++		let mut options = MockConnectOptions::new(version);
++		options.server_publish = Some(upstream.consume());
++		options.client_subscribe = Some(next.clone());
++		pairs.push(connect_mock(options).await);
++		keep.push(upstream);
++		upstream = next;
++	}
++	let subscriber = upstream;
++
++	let consumer = subscriber.consume();
++	tokio::time::timeout(TIMEOUT, consumer.routed("bcast")).await.expect("announce").expect("routed");
++	let remote = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("bcast")).await.expect("resolve").expect("resolves");
++
++	let mut group4 = track.create_group(moq_net::group::Info { sequence: 4 }).unwrap();
++	write(&mut group4, 4, 0..2);
++	let mut group5 = track.create_group(moq_net::group::Info { sequence: 5 }).unwrap();
++	write(&mut group5, 5, 0..10);
++
++	let subscribe = |start: u64| {
++		let track = remote.track("video").unwrap();
++		async move {
++			let subscription = moq_net::track::Subscription::default()
++				.with_start(moq_net::track::Position::group(start))
++				.with_max_age(Duration::from_secs(4));
++			tokio::time::timeout(TIMEOUT, track.subscribe(subscription)).await.expect("subscribe timeout").expect("subscribe")
++		}
++	};
++
++	if first_start == 0 {
++		eprintln!("{version} hops={hops} no first subscription");
++	}
++	let mut first = subscribe(if first_start == 0 { 4 } else { first_start }).await;
++	if first_start == 0 {
++		// Stand-in: the "second" below is then really a first, so drop this one unread
++		// would still count as a subscription. Skip the round's first half instead.
++	}
++	let mut chan1: Chan = tokio::sync::mpsc::unbounded_channel();
++	let got = drain(&mut first, &mut chan1, Duration::from_millis(1000)).await;
++	eprintln!("{version} hops={hops} first(start={first_start}): {}", summarize(&got));
++
++	eprintln!("=== DROP FIRST");
++	drop(first);
++	tokio::task::yield_now().await;
++	eprintln!("=== SUBSCRIBE SECOND");
++	let mut second = subscribe(4).await;
++	let mut chan2: Chan = tokio::sync::mpsc::unbounded_channel();
++	let got = drain(&mut second, &mut chan2, Duration::from_millis(500)).await;
++	eprintln!("{version} hops={hops}   second(start=4), before the rest: {}", summarize(&got));
++
++	write(&mut group5, 5, 10..30);
++	group5.finish().unwrap();
++	write(&mut group4, 4, 2..30);
++	group4.finish().unwrap();
++	let mut group6 = track.create_group(moq_net::group::Info { sequence: 6 }).unwrap();
++	write(&mut group6, 6, 0..30);
++	group6.finish().unwrap();
++
++	track.finish().unwrap();
++	let got = drain(&mut second, &mut chan2, Duration::from_millis(5000)).await;
++	eprintln!("{version} hops={hops}   second(start=4), after the rest:  {}", summarize(&got));
++	drop((pairs, keep, broadcast, track, subscriber));
++}
++
++#[tokio::test]
++async fn probe() {
++	let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).with_writer(std::io::stderr).without_time().try_init();
++	tokio::time::pause();
++	for version in ["moq-lite-06"] {
++		for hops in [2] {
++			for first_start in [4] {
++				for info in [false, true] {
++					eprintln!("--- info={info}");
++					round(version, hops, first_start, info).await;
++				}
++			}
++		}
++	}
++}
