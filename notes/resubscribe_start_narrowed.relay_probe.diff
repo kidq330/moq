@@ -1,0 +1,248 @@
+diff --git a/rs/moq-net/src/lite/publisher.rs b/rs/moq-net/src/lite/publisher.rs
+index 7a3d5ccb2..a2a6c51b0 100644
+--- a/rs/moq-net/src/lite/publisher.rs
++++ b/rs/moq-net/src/lite/publisher.rs
+@@ -2369,6 +2369,7 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
+ 				}
+ 				// Feed the full update into the model subscriber so the producer's
+ 				// aggregate reflects it (and a relay re-forwards it upstream).
++				eprintln!("DBG[{}] UPDATE recv sub={} start_group={:?} end_group={:?}", std::process::id(), self.ctx.id, upd.start_group, upd.end_group);
+ 				let bounds = Bounds::from(&upd);
+ 				let _ = self.track.update(crate::track::Subscription {
+ 					priority: upd.priority,
+@@ -2484,6 +2485,7 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
+ 		while self.skipped.contains(&start) {
+ 			start += 1;
+ 		}
++		eprintln!("DBG[{}] START sent sub={} source={:?} first_group={} resolved={}", std::process::id(), self.ctx.id, source, group.sequence, start);
+ 		self.skipped.clear();
+ 		self.start_sent = true;
+ 		// Only the group: the subscriber derives the start frame from its own request
+@@ -2505,6 +2507,7 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
+ 	fn serve(&mut self, group: group::Consumer) {
+ 		let sequence = group.sequence;
+ 		let frame_start = group.index();
++		eprintln!("DBG[{}] serving group sub={} seq={} frame_start={}", std::process::id(), self.ctx.id, sequence, frame_start);
+ 		tracing::debug!(subscribe = self.ctx.id, track = %self.ctx.track_name, sequence, "serving group");
+ 
+ 		// Use the latest priority for new groups so SUBSCRIBE_UPDATE applies to them too.
+diff --git a/rs/moq-net/src/lite/subscriber.rs b/rs/moq-net/src/lite/subscriber.rs
+index c6944a8e4..ffd6d8d18 100644
+--- a/rs/moq-net/src/lite/subscriber.rs
++++ b/rs/moq-net/src/lite/subscriber.rs
+@@ -770,7 +770,9 @@ impl<S: crate::transport::poll::Session> GroupRecv<S> {
+ 						let group_info = group::Info { sequence: hdr.sequence };
+ 						// Stats (groups/frames/bytes) are counted in the model as the group
+ 						// is written, through the tagged `track::Producer`.
+-						let mut group = entry.producer.create_group(group_info)?;
++						let created = entry.producer.create_group(group_info);
++						eprintln!("DBG[{}] group header recv sub={} seq={} frame_start={} create={:?}", std::process::id(), hdr.subscribe, hdr.sequence, hdr.frame_start, created.as_ref().map(|_| ()));
++						let mut group = created?;
+ 						// The stream may carry only the tail of the group; number the frames
+ 						// from where the publisher said they start so a reader splicing
+ 						// across routes lines them up.
+@@ -3165,6 +3167,7 @@ fn buffer_update<S: crate::transport::poll::Session>(
+ 	end: Option<Position>,
+ ) -> Result<(), Error> {
+ 	let bounds = WireBounds::new(active.start, end);
++	eprintln!("DBG[{}] UPDATE sent id={} start_group={:?} start_frame={:?} end_group={:?}", std::process::id(), active.id, bounds.start_group, bounds.start_frame, bounds.end_group);
+ 	active.stream.writer.buffer(&lite::SubscribeUpdate {
+ 		priority: active.priority,
+ 		max_age: active.max_age,
+@@ -3228,6 +3231,7 @@ impl<S: crate::transport::poll::Session> Establish<S> {
+ 						start_frame: bounds.start_frame,
+ 						end_frame: bounds.end_frame,
+ 					};
++					eprintln!("DBG[{}] SUBSCRIBE sent id={} start_group={:?} start_frame={:?} end_group={:?} (subscription.start={:?})", std::process::id(), msg.id, msg.start_group, msg.start_frame, msg.end_group, self.subscription.start);
+ 					stream.writer.buffer(&lite::ControlType::Subscribe)?;
+ 					stream.writer.buffer(&msg)?;
+ 					self.state = EstablishState::Send { stream };
+@@ -3680,6 +3684,7 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
+ 									// signal, so a spliced reader waiting on a skipped group
+ 									// fails over instead of stalling on a live route.
+ 									lite::SubscribeResponse::Start(start) => {
++										eprintln!("DBG[{}] START recv group={} active.start={:?} requested={:?}", std::process::id(), start.group, active.start, active.requested);
+ 										// A START describes the demand the SUBSCRIBE carried.
+ 										// It applies only while the current start still matches
+ 										// that demand (updates get no fresh START, so an update
+diff --git a/rs/moq-relay/tests/first_start_probe.rs b/rs/moq-relay/tests/first_start_probe.rs
+new file mode 100644
+index 000000000..ec09efdc4
+--- /dev/null
++++ b/rs/moq-relay/tests/first_start_probe.rs
+@@ -0,0 +1,175 @@
++//! Scratch probe: raw read of a first subscription with start = group 4 through the relay binary.
++use std::{net::TcpListener, time::Duration};
++
++use moq_tokio::moq_net;
++
++const TIMEOUT: Duration = Duration::from_secs(10);
++
++fn client() -> moq_tokio::Client {
++	let mut config = moq_tokio::connect::Config::default();
++	config.tls.insecure = Some(true);
++	config.once = Some(true);
++	config.websocket.delay = std::time::Duration::ZERO.into();
++	config.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
++	config.init(Default::default()).expect("client init")
++}
++
++fn spawn_relay() -> (u16, std::process::Child) {
++	let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
++	let port = probe.local_addr().expect("local addr").port();
++	drop(probe);
++	let cfg =
++		format!("[log]\nlevel = \"warn\"\n\n[listen]\ntcp.bind = \"127.0.0.1:{port}\"\n\n[auth]\npublic = \"**\"\n");
++	let cfg_path = std::env::temp_dir().join(format!("moq-first-start-relay-{port}.toml"));
++	std::fs::write(&cfg_path, cfg).expect("write relay config");
++	let child = std::process::Command::new(env!("CARGO_BIN_EXE_moq-relay"))
++		.arg(&cfg_path)
++		.spawn()
++		.expect("spawn moq-relay binary");
++	let deadline = std::time::Instant::now() + Duration::from_secs(10);
++	while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
++		assert!(std::time::Instant::now() < deadline, "relay never listened on {port}");
++		std::thread::sleep(Duration::from_millis(50));
++	}
++	(port, child)
++}
++
++fn write(group: &mut moq_net::group::Producer, sequence: u64, indices: std::ops::Range<u64>) {
++	for index in indices {
++		let ts = moq_net::Timestamp::from_micros(sequence * 1_000_000 + index * 33_000).unwrap();
++		group.write_frame(ts, vec![sequence as u8, index as u8]).unwrap();
++	}
++}
++
++type Chan = (tokio::sync::mpsc::UnboundedSender<String>, tokio::sync::mpsc::UnboundedReceiver<String>);
++async fn drain(sub: &mut moq_net::track::Subscriber, chan: &mut Chan, quiet: Duration) -> Vec<String> {
++	let (tx, rx) = chan;
++	let mut out = Vec::new();
++	loop {
++		tokio::select! {
++			group = sub.recv_group() => match group {
++				Ok(Some(mut group)) => {
++					let tx = tx.clone();
++					let _ = tx.send(format!("g{}:open", group.sequence));
++					tokio::spawn(async move {
++						let mut n = 0; let first = group.index();
++						loop {
++							match group.read_frame().await {
++								Ok(Some(_)) => n += 1,
++								Ok(None) => { let _ = tx.send(format!("g{}:end({n})", group.sequence)); break; }
++								Err(e) => { let _ = tx.send(format!("g{}:err({e},{n})", group.sequence)); break; }
++							}
++						}
++					});
++				}
++				Ok(None) => { out.push("track:end".into()); break; }
++				Err(e) => { out.push(format!("track:err({e})")); break; }
++			},
++			Some(ev) = rx.recv() => out.push(ev),
++			_ = tokio::time::sleep(quiet) => break,
++		}
++	}
++	while let Ok(ev) = rx.try_recv() {
++		out.push(ev);
++	}
++	out
++}
++
++/// `order`: which groups exist before the subscription, in creation order.
++async fn round(url: &url::Url, name: &str, order: &[u64], start: Option<u64>, resub: Option<(u64, bool)>) {
++	eprintln!("=== round {name}: groups created {order:?}, start {start:?}");
++	let pub_origin = moq_tokio::origin::spawn();
++	let broadcast = pub_origin.create_broadcast(name).expect("create broadcast");
++	broadcast.announce(Default::default()).expect("announce broadcast");
++	let track = broadcast.create_track("video", None).expect("create track");
++
++	let _pub_session = tokio::time::timeout(
++		TIMEOUT,
++		client().with_reconnect(false).with_publisher(&pub_origin).connect(url.clone()).established(),
++	)
++	.await
++	.expect("publisher connect timeout")
++	.expect("publisher connect failed");
++
++	let sub_origin = moq_tokio::origin::spawn();
++	let sub_consumer = sub_origin.consume();
++	let mut announcements = sub_consumer.announced();
++	let _sub_session = tokio::time::timeout(
++		TIMEOUT,
++		client().with_reconnect(false).with_subscriber(sub_origin).connect(url.clone()).established(),
++	)
++	.await
++	.expect("subscriber connect timeout")
++	.expect("subscriber connect failed");
++
++	let bc = loop {
++		let update = tokio::time::timeout(TIMEOUT, announcements.next())
++			.await
++			.expect("announce timeout")
++			.expect("origin closed");
++		if update.kind.is_active() && update.prefix.as_str() == name {
++			break sub_consumer.request_broadcast(&update.prefix).await.expect("resolves");
++		}
++	};
++
++	let mut groups = Vec::new();
++	for &sequence in order {
++		let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
++		write(&mut group, sequence, 0..(2 + 8 * (sequence - 4)));
++		groups.push(group);
++	}
++
++	let mut subscription = moq_net::track::Subscription::default().with_max_age(Duration::from_secs(4));
++	if let Some(start) = start {
++		subscription = subscription.with_start(moq_net::track::Position::group(start));
++	}
++	let mut sub = tokio::time::timeout(TIMEOUT, bc.track("video").unwrap().subscribe(subscription))
++		.await
++		.expect("subscribe timeout")
++		.expect("subscribe");
++	let mut chan: Chan = tokio::sync::mpsc::unbounded_channel();
++	let got = drain(&mut sub, &mut chan, Duration::from_millis(1000)).await;
++	eprintln!("=== result {name}: {got:?}");
++	if let Some((start, pause)) = resub {
++		drop(sub);
++		if pause {
++			tokio::time::sleep(Duration::from_millis(500)).await;
++		}
++		eprintln!("=== resubscribe start {start} pause {pause}");
++		let subscription = moq_net::track::Subscription::default()
++			.with_max_age(Duration::from_secs(4))
++			.with_start(moq_net::track::Position::group(start));
++		sub = tokio::time::timeout(TIMEOUT, bc.track("video").unwrap().subscribe(subscription))
++			.await
++			.expect("subscribe timeout")
++			.expect("subscribe");
++		chan = tokio::sync::mpsc::unbounded_channel();
++		let got = drain(&mut sub, &mut chan, Duration::from_millis(1000)).await;
++		eprintln!("=== result {name} resubscribed: {got:?}");
++	}
++	for group in groups.iter_mut() {
++		let sequence = group.sequence;
++		write(group, sequence, 20..30);
++	}
++	for mut group in groups {
++		group.finish().unwrap();
++	}
++	let mut g6 = track.create_group(moq_net::group::Info { sequence: 6 }).unwrap();
++	write(&mut g6, 6, 0..30);
++	g6.finish().unwrap();
++	let got = drain(&mut sub, &mut chan, Duration::from_millis(1000)).await;
++	eprintln!("=== result {name} after finish: {got:?}");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn probe() {
++	let (port, mut relay) = spawn_relay();
++	eprintln!("test pid {}, relay pid {}", std::process::id(), relay.id());
++	let url: url::Url = format!("tcp://127.0.0.1:{port}").parse().unwrap();
++	round(&url, "a-first5-resub4", &[4, 5], Some(5), Some((4, false))).await;
++	round(&url, "b-first5-resub4-pause", &[4, 5], Some(5), Some((4, true))).await;
++	round(&url, "c-first4-resub4", &[4, 5], Some(4), Some((4, false))).await;
++	round(&url, "d-first4-resub4-pause", &[4, 5], Some(4), Some((4, true))).await;
++	let _ = relay.kill();
++	let _ = relay.wait();
++}

@@ -1,0 +1,22 @@
+diff --git a/rs/moq-mux/src/container/consumer.rs b/rs/moq-mux/src/container/consumer.rs
+index ecaec6d60..93034d64e 100644
+--- a/rs/moq-mux/src/container/consumer.rs
++++ b/rs/moq-mux/src/container/consumer.rs
+@@ -465,6 +465,17 @@ impl<F: Container> Consumer<F> {
+ 			let idx = self
+ 				.pending
+ 				.partition_point(|g| g.group.sequence < reader.group.sequence);
++			// The track re-served a sequence we already hold: its earlier incarnation
++			// was aborted, so the replacement supersedes it. One we already played
++			// frames from stays, since the replacement would repeat them.
++			if let Some(old) = self.pending.get_mut(idx)
++				&& old.group.sequence == sequence
++			{
++				if old.delivered == 0 {
++					*old = reader;
++				}
++				continue;
++			}
+ 			self.pending.insert(idx, reader);
+ 		}
+ 	}
