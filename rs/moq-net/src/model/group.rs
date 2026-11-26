@@ -1280,22 +1280,21 @@ impl Consumer {
 		if self.expired {
 			return true;
 		}
-		let expired = match &mut self.inner {
-			// Otherwise only while expiry can still discard content or unblock a group
-			// that may grow.
+		self.expired = match &mut self.inner {
+			// Without pending wire data, only while expiry can still discard content or
+			// unblock a group that may grow.
 			ConsumerKind::Plain(plain) => {
-				(pending || plain.expiry_pending())
-					&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter))
+				let expired = (pending || plain.expiry_pending())
+					&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter));
+				if expired && !self.stale_counted.swap(true, Ordering::Relaxed) {
+					self.stale_stats.stale(plain.unread_content());
+				}
+				expired
 			}
-			// The route-specific cursors own expiry for a spliced group.
+			// The route copy owns expiry for a spliced group, its unread tail included:
+			// counting that here as well would discard it twice.
 			ConsumerKind::Spliced(spliced) => spliced.poll_expired_while_pending(waiter, pending),
 		};
-		if expired {
-			self.expired = true;
-			if !self.stale_counted.swap(true, Ordering::Relaxed) {
-				self.stale_stats.stale(self.unread_content());
-			}
-		}
 		self.expired
 	}
 

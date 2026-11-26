@@ -705,6 +705,18 @@ fn session(c: &mut Criterion) {
 		[1, 16, 256].map(|publishers| Shape { publishers, ..base }),
 	);
 	delivery(c, "viewers", [1, 16, 256].map(|viewers| Shape { viewers, ..base }));
+	// One broadcast fanned out to every viewer. The relay holds a group's stream per
+	// viewer until its FIN is acknowledged, each one watching the same route-fed track
+	// for the drift budget.
+	delivery(
+		c,
+		"fanout",
+		[1, 16, 256].map(|viewers| Shape {
+			publishers: 1,
+			viewers,
+			..base
+		}),
+	);
 	// Live media: every hop serves each group frame by frame.
 	delivery(
 		c,
