@@ -1181,11 +1181,10 @@ impl Consumer {
 	}
 
 	/// Content not already attributed as delivered by this handed-out cursor.
-	fn unread_content(&self) -> stats::Content {
+	pub(crate) fn unread_content(&self) -> stats::Content {
 		match &self.inner {
 			ConsumerKind::Plain(plain) => plain.unread_content(),
-			// Each route-specific plain cursor enforces expiry inside a spliced group.
-			ConsumerKind::Spliced(_) => stats::Content::default(),
+			ConsumerKind::Spliced(spliced) => spliced.unread_content(),
 		}
 	}
 
@@ -1278,25 +1277,26 @@ impl Consumer {
 
 	/// Keep checking expiry while a wire publisher still owns buffered group data.
 	pub(crate) fn poll_expired_while_pending(&mut self, waiter: &kio::Waiter, pending: bool) -> bool {
-		if !self.expired
-			&& (pending || self.expiry_pending())
-			&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter))
-		{
+		if self.expired {
+			return true;
+		}
+		let expired = match &mut self.inner {
+			// Otherwise only while expiry can still discard content or unblock a group
+			// that may grow.
+			ConsumerKind::Plain(plain) => {
+				(pending || plain.expiry_pending())
+					&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter))
+			}
+			// The route-specific cursors own expiry for a spliced group.
+			ConsumerKind::Spliced(spliced) => spliced.poll_expired_while_pending(waiter, pending),
+		};
+		if expired {
 			self.expired = true;
 			if !self.stale_counted.swap(true, Ordering::Relaxed) {
 				self.stale_stats.stale(self.unread_content());
 			}
 		}
 		self.expired
-	}
-
-	/// Whether expiry can still discard content or unblock a group that may grow.
-	fn expiry_pending(&self) -> bool {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.expiry_pending(),
-			// The route-specific plain cursors own expiry for a spliced group.
-			ConsumerKind::Spliced(_) => false,
-		}
 	}
 
 	/// Whether this cursor failed because its subscription max age budget expired.

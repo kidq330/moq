@@ -1076,6 +1076,27 @@ impl Group {
 		self.stale_stats = meter;
 	}
 
+	/// Whether the drift budget has given up on this group, asked of the route copy
+	/// being read; the spliced arm of [`group::Consumer::poll_expired_while_pending`].
+	///
+	/// A group with no copy in hand (between routes at a seam, or waiting on a
+	/// replacement) gets a `false`: with no cursor left that could judge it, keeping
+	/// it is the safe direction.
+	pub(crate) fn poll_expired_while_pending(&mut self, waiter: &kio::Waiter, pending: bool) -> bool {
+		self.current
+			.as_mut()
+			.is_some_and(|current| current.group.poll_expired_while_pending(waiter, pending))
+	}
+
+	/// Content the route copy being read has not delivered; the spliced arm of
+	/// [`group::Consumer::unread_content`].
+	pub(crate) fn unread_content(&self) -> crate::stats::Content {
+		self.current
+			.as_ref()
+			.map(|current| current.group.unread_content())
+			.unwrap_or_default()
+	}
+
 	/// Pre-latch the delivering route's own copy, so the payload it already
 	/// delivered survives even if its segment is pruned before the reader drains
 	/// it. Costs nothing otherwise: the per-frame reuse check validates the latch
@@ -2819,6 +2840,47 @@ mod test {
 		sub.end_at(..);
 		assert_eq!(recv(&mut sub), 2, "the stale parked group is skipped after finish");
 		recv_pending(&mut sub);
+	}
+
+	/// A wire publisher holds a group after its last frame, until the peer acknowledges
+	/// the stream. The spliced group has no drift policy of its own, so the route copy
+	/// it reads has to answer for it.
+	#[tokio::test]
+	async fn a_drained_group_still_expires_for_its_holder() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		write_group_at(&mut track_a, 0, "a0", Duration::ZERO);
+		let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut group), b"a0");
+		let waiter = kio::Waiter::noop();
+		assert!(!group.poll_expired_while_pending(&waiter, true), "still the live edge");
+
+		write_group_at(&mut track_a, 1, "a1", Duration::from_secs(30));
+		assert!(!group.poll_expired(&waiter), "nothing left for expiry to discard");
+		assert!(group.poll_expired_while_pending(&waiter, true));
+	}
+
+	/// The edge that makes a held group stale can live on a later route, which the
+	/// copy's own track never sees.
+	#[tokio::test]
+	async fn a_drained_group_expires_against_a_later_route() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		write_group_at(&mut track_a, 0, "a0", Duration::ZERO);
+		let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut group), b"a0");
+
+		producer.switch(&consumer_b, Position::group(1)).unwrap();
+		write_group_at(&mut track_b, 1, "b1", Duration::from_secs(30));
+		assert_eq!(recv(&mut sub), 1);
+		assert!(group.poll_expired_while_pending(&kio::Waiter::noop(), true));
 	}
 
 	#[tokio::test]
