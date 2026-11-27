@@ -19,7 +19,7 @@ use crate::{broadcast, cache, group, stats};
 use super::{Datagram, Requests};
 
 use super::Cap;
-use super::resume::Successor;
+use super::resume::{Boundary, Successor};
 pub use super::subscription::{Position, Subscription};
 
 use std::{
@@ -2595,7 +2595,7 @@ impl Consumer {
 		group: group::Consumer,
 		subscription: kio::Consumer<Subscription>,
 		anchor: kio::Consumer<Anchor>,
-		bound: Option<u64>,
+		bound: Option<Boundary>,
 	) -> group::Consumer {
 		let ConsumerKind::Plain(state) = &self.inner else {
 			return group;
@@ -3202,7 +3202,8 @@ struct GroupExpiry {
 	state: kio::ConsumerWeak<TrackState>,
 	subscription: kio::Consumer<Subscription>,
 	anchor: kio::Consumer<Anchor>,
-	bound: Option<u64>,
+	/// The segment boundary on the group's route, when a splice resolved it there.
+	bound: Option<Boundary>,
 	sequence: u64,
 }
 
@@ -3219,7 +3220,10 @@ impl group::Expiry for GroupExpiry {
 			anchor = (**current).clone();
 			Poll::<()>::Pending
 		});
-		let anchor = anchor.capped(self.bound);
+		let anchor = match &self.bound {
+			Some(bound) => bound.cap(anchor),
+			None => anchor,
+		};
 		let cap = anchor.cap;
 		// Before this track's lock: both may name another track, and nesting deadlocks.
 		let outer = anchor

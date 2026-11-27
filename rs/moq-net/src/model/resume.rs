@@ -196,6 +196,35 @@ impl PartialEq for Successor {
 	}
 }
 
+/// A segment's exclusive group boundary, and the splice that continues past it.
+#[derive(Clone)]
+pub(crate) struct Boundary {
+	state: kio::ConsumerWeak<ResumeState>,
+	after: u64,
+	group: u64,
+}
+
+impl Boundary {
+	/// `anchor` with its cap lowered to this boundary.
+	///
+	/// When the boundary lowers the cap, the reader's next group past it lives in a
+	/// later segment ([`Anchor::successor`]). Otherwise the anchor's own successor (a
+	/// wrapping splice's) still holds.
+	pub(crate) fn cap(&self, anchor: Anchor) -> Anchor {
+		let cap = anchor.cap;
+		let mut capped = anchor.capped(Some(self.group));
+		if capped.cap != cap {
+			capped.successor = Some(Successor {
+				state: self.state.clone(),
+				after: self.after,
+				boundary: self.group,
+				cap,
+			});
+		}
+		capped
+	}
+}
+
 /// How many segments a logical track keeps before pruning terminal ones from the
 /// front: the live segment plus a couple of predecessors still draining to slow
 /// readers. Without a bound, every failover leaves one dead segment (pinning a
@@ -1164,6 +1193,16 @@ impl Group {
 		}
 	}
 
+	/// The boundary `segment` puts on its route at the exclusive group `bound`, for a
+	/// copy resolved here to measure drift like that segment's own cursor.
+	fn boundary(&self, segment: u64, bound: Option<u64>) -> Option<Boundary> {
+		bound.map(|group| Boundary {
+			state: self.state.weak(),
+			after: segment,
+			group,
+		})
+	}
+
 	/// Locate the route owning `position`: the shared resolve behind the read
 	/// cursor and the finish probe. `dead` is the segment already given up on
 	/// for these frames. `Ready(None)` once nothing can ever serve them.
@@ -1276,7 +1315,8 @@ impl Group {
 			// `start_at` clamps up to the first frame the copy still holds, so landing
 			// higher than asked means this route can't cover the seam after all. Treat it
 			// like a dead copy and wait for one that can.
-			let mut group = track.guard_group(group, self.subscription.clone(), self.anchor.clone(), bound);
+			let boundary = self.boundary(segment, bound);
+			let mut group = track.guard_group(group, self.subscription.clone(), self.anchor.clone(), boundary);
 			group.set_stale_meter(self.stale_stats.clone());
 			group.start_at(self.index);
 			if group.index() != self.index {
@@ -1438,8 +1478,9 @@ impl Group {
 				// The continuation's copy declares the count: its own count
 				// already includes the frames it skipped.
 				Some(continuation) => {
+					let boundary = self.boundary(segment, bound);
 					let mut continuation =
-						track.guard_group(continuation, self.subscription.clone(), self.anchor.clone(), bound);
+						track.guard_group(continuation, self.subscription.clone(), self.anchor.clone(), boundary);
 					continuation.set_stale_meter(self.stale_stats.clone());
 					return continuation.poll_finished(waiter);
 				}
@@ -1806,25 +1847,16 @@ impl Subscriber {
 	/// against groups it will never surface: the route running past the boundary, or the
 	/// reader's own cap holding content back. The edge is left as is: it is the newest
 	/// content the logical track holds, which a segment's own track never sees.
-	///
-	/// When the boundary lowers the cap, the reader's next group past it lives in a
-	/// later segment of `state` ([`Anchor::successor`]). Otherwise the logical anchor's
-	/// own successor (a wrapping splice's) still holds.
 	fn segment_anchor(seg: &SegmentSub, anchor: Anchor, state: &kio::Consumer<ResumeState>) -> Anchor {
-		let Some(boundary) = seg.last_group() else {
+		let Some(group) = seg.last_group() else {
 			return anchor;
 		};
-		let cap = anchor.cap;
-		let mut capped = anchor.capped(Some(boundary));
-		if capped.cap != cap {
-			capped.successor = Some(Successor {
-				state: state.weak(),
-				after: seg.id,
-				boundary,
-				cap,
-			});
-		}
-		capped
+		let boundary = Boundary {
+			state: state.weak(),
+			after: seg.id,
+			group,
+		};
+		boundary.cap(anchor)
 	}
 
 	/// The logical drift anchor, as of the last [`Self::refresh_anchor`].
@@ -2921,6 +2953,38 @@ mod test {
 		let before = counter.count();
 		assert_eq!(recv(&mut sub), 1);
 		assert!(counter.count() > before, "the later route's edge lost its wakeup");
+		assert!(group.poll_expired_while_pending(&waiter, true));
+	}
+
+	/// A takeover puts a boundary on the route a held group came from, and the group's
+	/// next read resolves that route's copy afresh. The last group before the boundary
+	/// has no successor on its own route, so the fresh copy has to measure against the
+	/// next route like the segment's cursor does.
+	#[tokio::test]
+	async fn a_group_read_after_a_takeover_expires_against_the_next_route() {
+		let (track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		let mut source = track_a.create_group(group::Info { sequence: 0 }).unwrap();
+		source.write_frame(Timestamp::ZERO, b"a0".to_vec()).unwrap();
+		let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut group), b"a0");
+
+		producer.switch(&consumer_b, Position::group(1)).unwrap();
+		source.write_frame(Timestamp::ZERO, b"a1".to_vec()).unwrap();
+		assert_eq!(read(&mut group), b"a1");
+
+		let (counter, waker) = CountWaker::new();
+		let waiter = kio::Waiter::new(waker);
+		assert!(!group.poll_expired_while_pending(&waiter, true), "still the live edge");
+
+		let before = counter.count();
+		write_group_at(&mut track_b, 1, "b1", Duration::from_secs(30));
+		assert_eq!(recv(&mut sub), 1);
+		assert!(counter.count() > before, "the next route's edge lost its wakeup");
 		assert!(group.poll_expired_while_pending(&waiter, true));
 	}
 
