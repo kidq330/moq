@@ -2806,12 +2806,31 @@ mod group_priority_test {
 	/// that goes stale while waiting still expires instead of pinning them.
 	#[tokio::test]
 	async fn unacknowledged_fin_expires_with_the_group() {
+		unacknowledged_fin_expires(false).await;
+	}
+
+	/// A relay serves a route-fed track through a splice, whose groups defer the drift
+	/// budget to the route's own copy.
+	#[tokio::test]
+	async fn unacknowledged_fin_expires_with_the_spliced_group() {
+		unacknowledged_fin_expires(true).await;
+	}
+
+	async fn unacknowledged_fin_expires(spliced: bool) {
 		tokio::time::pause();
 
 		let session = SinkSession::new(Default::default()).with_unacked_fin();
 		let log = session.log.clone();
-		let track = track::Producer::new(std::sync::Arc::new(crate::broadcast::Info::default()), "test", None);
-		let mut subscriber = track.subscribe(None);
+		let info = std::sync::Arc::new(crate::broadcast::Info::default());
+		let track = track::Producer::new(info.clone(), "test", None);
+		let mut resume = crate::model::resume::Producer::new();
+		let consumer = if spliced {
+			resume.switch(track.consume(), None).unwrap();
+			track::Consumer::spliced("test".into(), info, resume.consume())
+		} else {
+			track.consume()
+		};
+		let mut subscriber = consumer.subscribe(None).await.unwrap();
 		let mut old = track.append_group().unwrap();
 		old.write_frame(crate::Timestamp::ZERO, b"old".as_slice()).unwrap();
 		old.finish().unwrap();

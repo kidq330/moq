@@ -196,6 +196,35 @@ impl PartialEq for Successor {
 	}
 }
 
+/// A segment's exclusive group boundary, and the splice that continues past it.
+#[derive(Clone)]
+pub(crate) struct Boundary {
+	state: kio::ConsumerWeak<ResumeState>,
+	after: u64,
+	group: u64,
+}
+
+impl Boundary {
+	/// `anchor` with its cap lowered to this boundary.
+	///
+	/// When the boundary lowers the cap, the reader's next group past it lives in a
+	/// later segment ([`Anchor::successor`]). Otherwise the anchor's own successor (a
+	/// wrapping splice's) still holds.
+	pub(crate) fn cap(&self, anchor: Anchor) -> Anchor {
+		let cap = anchor.cap;
+		let mut capped = anchor.capped(Some(self.group));
+		if capped.cap != cap {
+			capped.successor = Some(Successor {
+				state: self.state.clone(),
+				after: self.after,
+				boundary: self.group,
+				cap,
+			});
+		}
+		capped
+	}
+}
+
 /// How many segments a logical track keeps before pruning terminal ones from the
 /// front: the live segment plus a couple of predecessors still draining to slow
 /// readers. Without a bound, every failover leaves one dead segment (pinning a
@@ -955,6 +984,18 @@ fn last_group(end: Option<Position>) -> Option<u64> {
 	end.and_then(|end| Cap::from(end.group_end()).exclusive())
 }
 
+/// Where a route copy stops reading: its segment's bound on the group or the reader's
+/// own cap, whichever comes first.
+///
+/// The copy carries the reader's cap too because the copy is what judges expiry: frames
+/// past the cap are not content this reader waits on or loses.
+fn copy_end(cap: Option<u64>, end: Option<u64>) -> Bound<u64> {
+	cap.into_iter()
+		.chain(end)
+		.min()
+		.map_or(Bound::Unbounded, Bound::Excluded)
+}
+
 /// A group assembled from several routes' copies, joined at frame boundaries.
 ///
 /// Rather than being fed, it pulls: on every frame it asks the segment list which route
@@ -1076,6 +1117,27 @@ impl Group {
 		self.stale_stats = meter;
 	}
 
+	/// Whether the drift budget has given up on this group, asked of the route copy
+	/// being read; the spliced arm of [`group::Consumer::poll_expired_while_pending`].
+	///
+	/// A group with no copy in hand (between routes at a seam, or waiting on a
+	/// replacement) gets a `false`: with no cursor left that could judge it, keeping
+	/// it is the safe direction.
+	pub(crate) fn poll_expired_while_pending(&mut self, waiter: &kio::Waiter, pending: bool) -> bool {
+		self.current
+			.as_mut()
+			.is_some_and(|current| current.group.poll_expired_while_pending(waiter, pending))
+	}
+
+	/// Content the route copy being read has not delivered; the spliced arm of
+	/// [`group::Consumer::unread_content`].
+	pub(crate) fn unread_content(&self) -> crate::stats::Content {
+		self.current
+			.as_ref()
+			.map(|current| current.group.unread_content())
+			.unwrap_or_default()
+	}
+
 	/// Pre-latch the delivering route's own copy, so the payload it already
 	/// delivered survives even if its segment is pruned before the reader drains
 	/// it. Costs nothing otherwise: the per-frame reuse check validates the latch
@@ -1087,7 +1149,7 @@ impl Group {
 	/// misnumber its frames. The reader re-resolves instead, and the peek path's
 	/// own check buries the copy as lagged.
 	fn latched(mut self, segment: u64, cap: Option<u64>, bound: Option<u64>, mut group: group::Consumer) -> Self {
-		group.end_at(cap.map_or(Bound::Unbounded, Bound::Excluded));
+		group.end_at(copy_end(cap, self.end));
 		group.start_at(self.index);
 		group.set_stale_meter(self.stale_stats.clone());
 		if group.index() == self.index {
@@ -1126,6 +1188,19 @@ impl Group {
 	/// Cap the reader at `index` (exclusive), the form [`Cap::exclusive`] produces.
 	pub fn end_at(&mut self, index: Option<u64>) {
 		self.end = index;
+		if let Some(current) = &mut self.current {
+			current.group.end_at(copy_end(current.cap, index));
+		}
+	}
+
+	/// The boundary `segment` puts on its route at the exclusive group `bound`, for a
+	/// copy resolved here to measure drift like that segment's own cursor.
+	fn boundary(&self, segment: u64, bound: Option<u64>) -> Option<Boundary> {
+		bound.map(|group| Boundary {
+			state: self.state.weak(),
+			after: segment,
+			group,
+		})
 	}
 
 	/// Locate the route owning `position`: the shared resolve behind the read
@@ -1240,7 +1315,8 @@ impl Group {
 			// `start_at` clamps up to the first frame the copy still holds, so landing
 			// higher than asked means this route can't cover the seam after all. Treat it
 			// like a dead copy and wait for one that can.
-			let mut group = track.guard_group(group, self.subscription.clone(), self.anchor.clone(), bound);
+			let boundary = self.boundary(segment, bound);
+			let mut group = track.guard_group(group, self.subscription.clone(), self.anchor.clone(), boundary);
 			group.set_stale_meter(self.stale_stats.clone());
 			group.start_at(self.index);
 			if group.index() != self.index {
@@ -1248,7 +1324,7 @@ impl Group {
 				continue;
 			}
 
-			group.end_at(cap.map_or(Bound::Unbounded, Bound::Excluded));
+			group.end_at(copy_end(cap, self.end));
 			self.current = Some(Current {
 				segment,
 				cap,
@@ -1402,8 +1478,9 @@ impl Group {
 				// The continuation's copy declares the count: its own count
 				// already includes the frames it skipped.
 				Some(continuation) => {
+					let boundary = self.boundary(segment, bound);
 					let mut continuation =
-						track.guard_group(continuation, self.subscription.clone(), self.anchor.clone(), bound);
+						track.guard_group(continuation, self.subscription.clone(), self.anchor.clone(), boundary);
 					continuation.set_stale_meter(self.stale_stats.clone());
 					return continuation.poll_finished(waiter);
 				}
@@ -1770,25 +1847,16 @@ impl Subscriber {
 	/// against groups it will never surface: the route running past the boundary, or the
 	/// reader's own cap holding content back. The edge is left as is: it is the newest
 	/// content the logical track holds, which a segment's own track never sees.
-	///
-	/// When the boundary lowers the cap, the reader's next group past it lives in a
-	/// later segment of `state` ([`Anchor::successor`]). Otherwise the logical anchor's
-	/// own successor (a wrapping splice's) still holds.
 	fn segment_anchor(seg: &SegmentSub, anchor: Anchor, state: &kio::Consumer<ResumeState>) -> Anchor {
-		let Some(boundary) = seg.last_group() else {
+		let Some(group) = seg.last_group() else {
 			return anchor;
 		};
-		let cap = anchor.cap;
-		let mut capped = anchor.capped(Some(boundary));
-		if capped.cap != cap {
-			capped.successor = Some(Successor {
-				state: state.weak(),
-				after: seg.id,
-				boundary,
-				cap,
-			});
-		}
-		capped
+		let boundary = Boundary {
+			state: state.weak(),
+			after: seg.id,
+			group,
+		};
+		boundary.cap(anchor)
 	}
 
 	/// The logical drift anchor, as of the last [`Self::refresh_anchor`].
@@ -2819,6 +2887,173 @@ mod test {
 		sub.end_at(..);
 		assert_eq!(recv(&mut sub), 2, "the stale parked group is skipped after finish");
 		recv_pending(&mut sub);
+	}
+
+	/// A wire publisher holds a group after its last frame, until the peer acknowledges
+	/// the stream. The spliced group has no drift policy of its own, so the route copy
+	/// it reads has to answer for it.
+	#[tokio::test]
+	async fn a_drained_group_still_expires_for_its_holder() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		write_group_at(&mut track_a, 0, "a0", Duration::ZERO);
+		let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut group), b"a0");
+		let waiter = kio::Waiter::noop();
+		assert!(!group.poll_expired_while_pending(&waiter, true), "still the live edge");
+
+		write_group_at(&mut track_a, 1, "a1", Duration::from_secs(30));
+		assert!(!group.poll_expired(&waiter), "nothing left for expiry to discard");
+		assert!(group.poll_expired_while_pending(&waiter, true));
+	}
+
+	/// The edge that makes a held group stale can live on a later route, which the
+	/// copy's own track never sees.
+	#[tokio::test]
+	async fn a_drained_group_expires_against_a_later_route() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		write_group_at(&mut track_a, 0, "a0", Duration::ZERO);
+		let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut group), b"a0");
+
+		producer.switch(&consumer_b, Position::group(1)).unwrap();
+		write_group_at(&mut track_b, 1, "b1", Duration::from_secs(30));
+		assert_eq!(recv(&mut sub), 1);
+		assert!(group.poll_expired_while_pending(&kio::Waiter::noop(), true));
+	}
+
+	/// A stream parked on its FIN acknowledgement is only polled again when something
+	/// wakes it, and the edge that makes its group stale can arrive on a later route.
+	#[tokio::test]
+	async fn a_held_group_is_woken_by_a_later_route() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		write_group_at(&mut track_a, 0, "a0", Duration::ZERO);
+		let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut group), b"a0");
+
+		let (counter, waker) = CountWaker::new();
+		let waiter = kio::Waiter::new(waker);
+		assert!(!group.poll_expired_while_pending(&waiter, true), "still the live edge");
+
+		producer.switch(&consumer_b, Position::group(1)).unwrap();
+		write_group_at(&mut track_b, 1, "b1", Duration::from_secs(30));
+		let before = counter.count();
+		assert_eq!(recv(&mut sub), 1);
+		assert!(counter.count() > before, "the later route's edge lost its wakeup");
+		assert!(group.poll_expired_while_pending(&waiter, true));
+	}
+
+	/// A takeover puts a boundary on the route a held group came from, and the group's
+	/// next read resolves that route's copy afresh. The last group before the boundary
+	/// has no successor on its own route, so the fresh copy has to measure against the
+	/// next route like the segment's cursor does.
+	#[tokio::test]
+	async fn a_group_read_after_a_takeover_expires_against_the_next_route() {
+		let (track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		let mut source = track_a.create_group(group::Info { sequence: 0 }).unwrap();
+		source.write_frame(Timestamp::ZERO, b"a0".to_vec()).unwrap();
+		let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut group), b"a0");
+
+		producer.switch(&consumer_b, Position::group(1)).unwrap();
+		source.write_frame(Timestamp::ZERO, b"a1".to_vec()).unwrap();
+		assert_eq!(read(&mut group), b"a1");
+
+		let (counter, waker) = CountWaker::new();
+		let waiter = kio::Waiter::new(waker);
+		assert!(!group.poll_expired_while_pending(&waiter, true), "still the live edge");
+
+		let before = counter.count();
+		write_group_at(&mut track_b, 1, "b1", Duration::from_secs(30));
+		assert_eq!(recv(&mut sub), 1);
+		assert!(counter.count() > before, "the next route's edge lost its wakeup");
+		assert!(group.poll_expired_while_pending(&waiter, true));
+	}
+
+	/// A meter on a registry of its own, to read back what expiry discarded.
+	fn stale_meter() -> (crate::stats::Registry, crate::stats::Meter) {
+		let stats = crate::stats::Registry::new(crate::stats::Config::new());
+		let session = stats.tier(crate::stats::Tier::default()).session("root");
+		let meter = session.egress("demo").meter();
+		(stats, meter)
+	}
+
+	fn stale(stats: &crate::stats::Registry) -> crate::stats::Content {
+		let traffic = stats.snapshot().traffic();
+		let publisher = traffic
+			.iter()
+			.find(|(_, role, _)| *role == crate::stats::Role::Publisher);
+		publisher.map(|(_, _, traffic)| traffic.stale).unwrap_or_default()
+	}
+
+	/// A boundary landing on the route re-resolves the copy a held group reads, and
+	/// the fresh copy has not seen the group's earlier accounting. Its unread tail is
+	/// still discarded once.
+	#[tokio::test]
+	async fn an_expired_group_counts_its_stale_tail_once() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (_track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		let mut source = track_a.create_group(group::Info { sequence: 0 }).unwrap();
+		source.write_frame(Timestamp::ZERO, b"a0".to_vec()).unwrap();
+		let (stats, meter) = stale_meter();
+		let group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		let mut group = group.with_meter(meter);
+		assert_eq!(read(&mut group), b"a0");
+
+		producer.switch(&consumer_b, Position::group(2)).unwrap();
+		source.write_frame(Timestamp::ZERO, b"a1".to_vec()).unwrap();
+		assert_eq!(read(&mut group), b"a1");
+		source.write_frame(Timestamp::ZERO, b"tail".to_vec()).unwrap();
+
+		write_group_at(&mut track_a, 1, "a1", Duration::from_secs(30));
+		assert!(group.poll_expired_while_pending(&kio::Waiter::noop(), true));
+		let stale = stale(&stats);
+		assert_eq!((stale.frames, stale.bytes), (1, 4));
+	}
+
+	/// A reader capped below the copy's end never asked for the frames past its cap,
+	/// so they are not content its expiry discards.
+	#[tokio::test]
+	async fn an_expired_group_counts_nothing_past_its_cap() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		let mut source = track_a.create_group(group::Info { sequence: 0 }).unwrap();
+		source.write_frame(Timestamp::ZERO, b"a0".to_vec()).unwrap();
+		let (stats, meter) = stale_meter();
+		let group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		let mut group = group.with_meter(meter);
+		group.set_frames(..1);
+		assert_eq!(read(&mut group), b"a0");
+		source.write_frame(Timestamp::ZERO, b"past".to_vec()).unwrap();
+
+		write_group_at(&mut track_a, 1, "a1", Duration::from_secs(30));
+		assert!(group.poll_expired_while_pending(&kio::Waiter::noop(), true));
+		assert_eq!(stale(&stats), crate::stats::Content::default());
 	}
 
 	#[tokio::test]

@@ -1181,11 +1181,10 @@ impl Consumer {
 	}
 
 	/// Content not already attributed as delivered by this handed-out cursor.
-	fn unread_content(&self) -> stats::Content {
+	pub(crate) fn unread_content(&self) -> stats::Content {
 		match &self.inner {
 			ConsumerKind::Plain(plain) => plain.unread_content(),
-			// Each route-specific plain cursor enforces expiry inside a spliced group.
-			ConsumerKind::Spliced(_) => stats::Content::default(),
+			ConsumerKind::Spliced(spliced) => spliced.unread_content(),
 		}
 	}
 
@@ -1278,25 +1277,25 @@ impl Consumer {
 
 	/// Keep checking expiry while a wire publisher still owns buffered group data.
 	pub(crate) fn poll_expired_while_pending(&mut self, waiter: &kio::Waiter, pending: bool) -> bool {
-		if !self.expired
-			&& (pending || self.expiry_pending())
-			&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter))
-		{
-			self.expired = true;
-			if !self.stale_counted.swap(true, Ordering::Relaxed) {
-				self.stale_stats.stale(self.unread_content());
+		if self.expired {
+			return true;
+		}
+		self.expired = match &mut self.inner {
+			// Without pending wire data, only while expiry can still discard content or
+			// unblock a group that may grow.
+			ConsumerKind::Plain(plain) => {
+				let expired = (pending || plain.expiry_pending())
+					&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter));
+				if expired && !self.stale_counted.swap(true, Ordering::Relaxed) {
+					self.stale_stats.stale(plain.unread_content());
+				}
+				expired
 			}
-		}
+			// The route copy owns expiry for a spliced group, its unread tail included:
+			// counting that here as well would discard it twice.
+			ConsumerKind::Spliced(spliced) => spliced.poll_expired_while_pending(waiter, pending),
+		};
 		self.expired
-	}
-
-	/// Whether expiry can still discard content or unblock a group that may grow.
-	fn expiry_pending(&self) -> bool {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.expiry_pending(),
-			// The route-specific plain cursors own expiry for a spliced group.
-			ConsumerKind::Spliced(_) => false,
-		}
 	}
 
 	/// Whether this cursor failed because its subscription max age budget expired.
